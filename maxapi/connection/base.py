@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import aiofiles
 import puremagic
-from aiohttp import ClientConnectionError, ClientSession, FormData
+from aiohttp import ClientConnectionError, ClientSession, FormData, TCPConnector
 from pydantic import BaseModel
 
 from ..enums.api_path import ApiPath
@@ -87,11 +87,13 @@ class BaseConnection(BotMixin):
         bot = self._ensure_bot()
 
         if not bot.session:
+            session_kwargs = dict(bot.default_connection.kwargs)
+            session_kwargs.setdefault("connector", TCPConnector(ssl=False))
             bot.session = ClientSession(
                 base_url=bot.api_url,
                 timeout=bot.default_connection.timeout,
                 headers=bot.headers,
-                **bot.default_connection.kwargs,
+                **session_kwargs,
             )
 
         try:
