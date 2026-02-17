@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field
 
 from ...enums.attachment import AttachmentType
 from ...types.attachments.buttons import InlineButtonUnion
@@ -37,12 +37,12 @@ class PhotoAttachmentPayload(BaseModel):
     photo_id: int | None
     token: str | None
     url: str | None
-
-    @root_validator
-    def validate_any_field(cls, values):
-        if not any(values.get(k) is not None for k in ("photo_id", "token", "url")):
-            raise ValueError("Нужно указать хотя бы один из параметров: photo_id, token, url.")
-        return values
+    #
+    # @root_validator
+    # def validate_any_field(cls, values):
+    #     if not any(values.get(k) is not None for k in ("photo_id", "token", "url")):
+    #         raise ValueError("Нужно указать хотя бы один из параметров: photo_id, token, url.")
+    #     return values
 
 
 class OtherAttachmentPayload(BaseModel):
