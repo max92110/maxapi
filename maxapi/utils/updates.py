@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import time
 from typing import TYPE_CHECKING, Any
 
 from ..enums.chat_type import ChatType
@@ -33,13 +33,13 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
     Returns:
         Any: Обновлённый объект события.
     """
-
+    t0 = time.perf_counter()
     if not bot.auto_requests:
         return event_object
 
     if hasattr(event_object, "chat_id"):
         event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
-
+    print((time.perf_counter() - t0) * 1000)
     if isinstance(event_object, (MessageCreated, MessageEdited)):
         if event_object.message.recipient.chat_id is not None:
             event_object.chat = await bot.get_chat_by_id(
@@ -47,7 +47,7 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
             )
 
         event_object.from_user = getattr(event_object.message, "sender", None)
-
+        print((time.perf_counter() - t0) * 1000)
     elif isinstance(event_object, MessageCallback):
         message = event_object.message
         if message is not None and message.recipient.chat_id is not None:
@@ -55,7 +55,7 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
             event_object.chat = await bot.get_chat_by_id(chat_id)
 
         event_object.from_user = getattr(event_object.callback, "user", None)
-
+        print((time.perf_counter() - t0) * 1000)
     elif isinstance(event_object, MessageRemoved):
         event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
 
@@ -66,17 +66,19 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
 
         elif event_object.chat.type == ChatType.DIALOG:
             event_object.from_user = event_object.chat  # pyright: ignore[reportAttributeAccessIssue]
-
+        print((time.perf_counter() - t0) * 1000)
     elif isinstance(event_object, UserRemoved):
         event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
         if event_object.admin_id:
             event_object.from_user = await bot.get_chat_member(
                 chat_id=event_object.chat_id, user_id=event_object.admin_id
             )
+        print((time.perf_counter() - t0) * 1000)
 
     elif isinstance(event_object, UserAdded):
         event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
         event_object.from_user = event_object.user
+        print((time.perf_counter() - t0) * 1000)
 
     elif isinstance(
         event_object,
@@ -93,6 +95,7 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
     ):
         event_object.chat = await bot.get_chat_by_id(event_object.chat_id)
         event_object.from_user = event_object.user
+        print((time.perf_counter() - t0) * 1000)
 
     if isinstance(
         event_object, (MessageCreated, MessageEdited, MessageCallback)
@@ -105,8 +108,9 @@ async def enrich_event(event_object: Any, bot: Bot) -> Any:
                 for att in object_message.body.attachments or []:
                     if hasattr(att, "bot"):
                         att.bot = bot
-
+        print((time.perf_counter() - t0) * 1000)
     if hasattr(event_object, "bot"):
         event_object.bot = bot
+        print((time.perf_counter() - t0) * 1000)
 
     return event_object
