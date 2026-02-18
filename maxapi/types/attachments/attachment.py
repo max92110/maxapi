@@ -34,9 +34,9 @@ class PhotoAttachmentPayload(BaseModel):
         url (str): URL фотографии.
     """
 
-    photo_id: int | None
-    token: str | None
-    url: str | None
+    photo_id: int | None = None
+    token: str | None = None
+    url: str | None = None
     #
     # @root_validator
     # def validate_any_field(cls, values):

@@ -72,7 +72,13 @@ class Dispatcher(BotMixin):
     """
 
     def __init__(
-        self, router_id: str | None = None, use_create_task: bool = False
+        self,
+        router_id: str | None = None,
+        use_create_task: bool = False,
+        context_factory: Callable[..., MemoryContext] | None = None,
+        context_kwargs: Optional[Dict[str, Any]] = None,
+        redis_client: Any | None = None,
+        redis_prefix: str = "maxapi:context",
     ) -> None:
         """
         Инициализация диспетчера.
@@ -80,6 +86,10 @@ class Dispatcher(BotMixin):
         Args:
             router_id (str | None): Идентификатор роутера для логов.
             use_create_task (bool): Флаг, отвечающий за параллелизацию обработок событий.
+            context_factory (Callable): Фабрика для создания контекстов памяти.
+            context_kwargs (dict | None): Дополнительные аргументы для контекста.
+            redis_client (Any | None): Экземпляр redis.asyncio.Redis для хранения контекста.
+            redis_prefix (str): Префикс ключей Redis.
         """
 
         self.router_id = router_id
@@ -96,6 +106,12 @@ class Dispatcher(BotMixin):
         self.on_started_func: Optional[Callable] = None
         self.polling = False
         self.use_create_task = use_create_task
+        self.context_factory = context_factory or MemoryContext
+        self.context_kwargs = context_kwargs or {}
+
+        if redis_client is not None:
+            self.context_kwargs.setdefault("redis_client", redis_client)
+            self.context_kwargs.setdefault("redis_prefix", redis_prefix)
 
         self.message_created = Event(
             update_type=UpdateType.MESSAGE_CREATED, router=self
@@ -319,7 +335,9 @@ class Dispatcher(BotMixin):
             if ctx.chat_id == chat_id and ctx.user_id == user_id:
                 return ctx
 
-        new_ctx = MemoryContext(chat_id, user_id)
+        new_ctx = self.context_factory(
+            chat_id, user_id, **self.context_kwargs
+        )
         self.contexts.append(new_ctx)
         return new_ctx
 

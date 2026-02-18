@@ -1,7 +1,11 @@
 import asyncio
-from typing import Any, Dict, Optional, Union
+import json
+from typing import Any, Dict, Optional, Union, TYPE_CHECKING
 
-from ..context.state_machine import State
+from ..context.state_machine import State, StatesGroup
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
 
 
 class MemoryContext:
@@ -13,12 +17,48 @@ class MemoryContext:
         user_id (Optional[int]): Идентификатор пользователя
     """
 
-    def __init__(self, chat_id: Optional[int], user_id: Optional[int]):
+    def __init__(
+        self,
+        chat_id: Optional[int],
+        user_id: Optional[int],
+        redis_client: Optional["Redis[Any]"] = None,
+        redis_prefix: str = "maxapi:context",
+    ):
         self.chat_id = chat_id
         self.user_id = user_id
         self._context: Dict[str, Any] = {}
         self._state: State | str | None = None
         self._lock = asyncio.Lock()
+        self._redis = redis_client
+        self._redis_prefix = redis_prefix.rstrip(":")
+
+    def _key(self, kind: str) -> str:
+        chat = "none" if self.chat_id is None else str(self.chat_id)
+        user = "none" if self.user_id is None else str(self.user_id)
+        return f"{self._redis_prefix}:{kind}:{chat}:{user}"
+
+    @staticmethod
+    def _serialize_state(state: Optional[Union[State, str]]) -> Optional[str]:
+        if state is None:
+            return None
+        if isinstance(state, State):
+            return state.name
+        return str(state)
+
+    @staticmethod
+    def _restore_state(state_name: str | None) -> Optional[State | str]:
+        if not state_name:
+            return None
+
+        for group in StatesGroup.__subclasses__():
+            for attr in dir(group):
+                candidate = getattr(group, attr)
+                if isinstance(candidate, State) and str(candidate) == state_name:
+                    return candidate
+
+        state = State()
+        state.name = state_name
+        return state
 
     async def get_data(self) -> dict[str, Any]:
         """
@@ -29,7 +69,20 @@ class MemoryContext:
         """
 
         async with self._lock:
-            return self._context
+            if not self._redis:
+                return self._context
+
+            raw = await self._redis.get(self._key("data"))
+            if raw is None:
+                return {}
+
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
 
     async def set_data(self, data: dict[str, Any]):
         """
@@ -40,7 +93,12 @@ class MemoryContext:
         """
 
         async with self._lock:
-            self._context = data
+            if not self._redis:
+                self._context = data
+            else:
+                await self._redis.set(
+                    self._key("data"), json.dumps(data, default=str)
+                )
 
     async def update_data(self, **kwargs: Any) -> None:
         """
@@ -51,7 +109,26 @@ class MemoryContext:
         """
 
         async with self._lock:
-            self._context.update(kwargs)
+            if not self._redis:
+                self._context.update(kwargs)
+            else:
+                raw = await self._redis.get(self._key("data"))
+
+                if raw is None:
+                    current = {}
+                else:
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
+
+                    try:
+                        current = json.loads(raw)
+                    except json.JSONDecodeError:
+                        current = {}
+
+                current.update(kwargs)
+                await self._redis.set(
+                    self._key("data"), json.dumps(current, default=str)
+                )
 
     async def set_state(self, state: Optional[Union[State, str]] = None):
         """
@@ -62,7 +139,18 @@ class MemoryContext:
         """
 
         async with self._lock:
-            self._state = state
+            serialized_state = self._serialize_state(state)
+
+            if not self._redis:
+                self._state = state
+            else:
+                key = self._key("state")
+                if serialized_state is None:
+                    await self._redis.delete(key)
+                else:
+                    await self._redis.set(key, serialized_state)
+
+                self._state = self._restore_state(serialized_state)
 
     async def get_state(self) -> Optional[State | str]:
         """
@@ -73,7 +161,21 @@ class MemoryContext:
         """
 
         async with self._lock:
-            return self._state
+            if not self._redis:
+                return self._state
+
+            raw = await self._redis.get(self._key("state"))
+
+            if raw is None:
+                self._state = None
+                return None
+
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+
+            restored = self._restore_state(raw)
+            self._state = restored
+            return restored
 
     async def clear(self):
         """
@@ -83,3 +185,6 @@ class MemoryContext:
         async with self._lock:
             self._state = None
             self._context = {}
+            if self._redis:
+                await self._redis.delete(self._key("data"))
+                await self._redis.delete(self._key("state"))

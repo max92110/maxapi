@@ -42,6 +42,22 @@ async def age_handler(event: MessageCreated, context: MemoryContext):
 - `set_data(data)` — полностью заменить данные
 - `clear()` — очистить контекст и сбросить состояние
 
+## Redis-хранилище
+
+Для сохранения контекста между перезапусками можно использовать Redis.
+
+1. Установите зависимость: `pip install maxapi[redis]`
+2. Передайте Redis-клиент при создании диспетчера:
+
+```python
+import redis.asyncio as redis
+from maxapi import Dispatcher
+
+redis_client = redis.from_url("redis://localhost:6379")
+
+dp = Dispatcher(redis_client=redis_client, redis_prefix="maxapi:context")
+```
+
 ## StatesGroup
 
 Группа состояний для FSM:

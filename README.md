@@ -35,7 +35,7 @@ pip install maxapi
 Свежая версия, возможны баги. Рекомендуется только для ознакомления с новыми коммитами.
 
 ```bash
-pip install git+https://github.com/love-apples/maxapi.git
+pip install git+https://github.com/max92110/maxapi.git
 ```
 
 
