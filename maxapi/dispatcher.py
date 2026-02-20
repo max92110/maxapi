@@ -79,6 +79,7 @@ class Dispatcher(BotMixin):
         context_kwargs: Optional[Dict[str, Any]] = None,
         redis_client: Any | None = None,
         redis_prefix: str = "maxapi:context",
+        redis_ttl: int | None = None,
     ) -> None:
         """
         Инициализация диспетчера.
@@ -90,6 +91,7 @@ class Dispatcher(BotMixin):
             context_kwargs (dict | None): Дополнительные аргументы для контекста.
             redis_client (Any | None): Экземпляр redis.asyncio.Redis для хранения контекста.
             redis_prefix (str): Префикс ключей Redis.
+            redis_ttl (int | None): Время жизни ключей контекста в секундах.
         """
 
         self.router_id = router_id
@@ -109,9 +111,11 @@ class Dispatcher(BotMixin):
         self.context_factory = context_factory or MemoryContext
         self.context_kwargs = context_kwargs or {}
 
-        if redis_client is not None:
+        if redis_client:
             self.context_kwargs.setdefault("redis_client", redis_client)
             self.context_kwargs.setdefault("redis_prefix", redis_prefix)
+            if redis_ttl:
+                self.context_kwargs.setdefault("redis_ttl", redis_ttl)
 
         self.message_created = Event(
             update_type=UpdateType.MESSAGE_CREATED, router=self

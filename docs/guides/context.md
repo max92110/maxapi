@@ -55,7 +55,11 @@ from maxapi import Dispatcher
 
 redis_client = redis.from_url("redis://localhost:6379")
 
-dp = Dispatcher(redis_client=redis_client, redis_prefix="maxapi:context")
+dp = Dispatcher(
+    redis_client=redis_client,
+    redis_prefix="maxapi:context",
+    redis_ttl=3600,  # опционально: время жизни ключей в секундах
+)
 ```
 
 ## StatesGroup

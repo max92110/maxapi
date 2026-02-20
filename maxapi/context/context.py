@@ -23,6 +23,7 @@ class MemoryContext:
         user_id: Optional[int],
         redis_client: Optional["Redis[Any]"] = None,
         redis_prefix: str = "maxapi:context",
+        redis_ttl: Optional[int] = None,
     ):
         self.chat_id = chat_id
         self.user_id = user_id
@@ -31,6 +32,7 @@ class MemoryContext:
         self._lock = asyncio.Lock()
         self._redis = redis_client
         self._redis_prefix = redis_prefix.rstrip(":")
+        self._redis_ttl = redis_ttl
 
     def _key(self, kind: str) -> str:
         chat = "none" if self.chat_id is None else str(self.chat_id)
@@ -97,7 +99,9 @@ class MemoryContext:
                 self._context = data
             else:
                 await self._redis.set(
-                    self._key("data"), json.dumps(data, default=str)
+                    self._key("data"),
+                    json.dumps(data, default=str),
+                    ex=self._redis_ttl,
                 )
 
     async def update_data(self, **kwargs: Any) -> None:
@@ -127,7 +131,9 @@ class MemoryContext:
 
                 current.update(kwargs)
                 await self._redis.set(
-                    self._key("data"), json.dumps(current, default=str)
+                    self._key("data"),
+                    json.dumps(current, default=str),
+                    ex=self._redis_ttl,
                 )
 
     async def set_state(self, state: Optional[Union[State, str]] = None):
@@ -148,7 +154,9 @@ class MemoryContext:
                 if serialized_state is None:
                     await self._redis.delete(key)
                 else:
-                    await self._redis.set(key, serialized_state)
+                    await self._redis.set(
+                        key, serialized_state, ex=self._redis_ttl
+                    )
 
                 self._state = self._restore_state(serialized_state)
 
