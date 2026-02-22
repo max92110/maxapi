@@ -673,7 +673,7 @@ class Dispatcher(BotMixin):
                 )
         except Exception as e:
             logger_dp.exception(
-                f"Ошибка при обработке события: router_id: {router_id} | {process_info} | {e} "
+                f"Ошибка при обработке события: router_id: {router_id} | {process_info}"
             )
             raise e
 
