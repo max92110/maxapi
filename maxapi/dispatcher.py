@@ -672,7 +672,7 @@ class Dispatcher(BotMixin):
                     f"Проигнорировано: router_id: {router_id} | {process_info}"
                 )
         except Exception as e:
-            logger_dp.error(
+            logger_dp.warning(
                 f"Ошибка при обработке события: router_id: {router_id} | {process_info}",
                 exc_info=False,
             )
