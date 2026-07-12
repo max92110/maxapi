@@ -1,13 +1,17 @@
-from enum import Enum
+from enum import auto, unique
+
+from ._compat import StrEnum
 
 
-class Intent(str, Enum):
+@unique
+class Intent(StrEnum):
     """
     Тип интента (намерения) кнопки.
 
-    Используется для стилизации и логической классификации пользовательских действий.
+    Используется для стилизации и логической классификации
+    пользовательских действий.
     """
 
-    DEFAULT = "default"
-    POSITIVE = "positive"
-    NEGATIVE = "negative"
+    DEFAULT = auto()
+    POSITIVE = auto()
+    NEGATIVE = auto()

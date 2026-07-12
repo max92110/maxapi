@@ -15,17 +15,20 @@ async def text_handler(event: MessageCreated):
     ...
 
 # Сообщения с вложениями
-@dp.message_created(F.message.attachments)
+@dp.message_created(F.message.body.attachments)
 async def attachment_handler(event: MessageCreated):
     ...
 
 # Комбинация условий
 from maxapi.enums.chat_type import ChatType
 
-@dp.message_created(F.message.body.text & F.message.chat.type == ChatType.PRIVATE)
-async def private_text_handler(event: MessageCreated):
+# ⚠️ Скобки обязательны: & и | имеют более высокий приоритет, чем ==
+@dp.message_created(F.message.body.text & (F.message.chat.type == ChatType.DIALOG))
+async def dialog_text_handler(event: MessageCreated):
     ...
 ```
+
+Для личных сообщений используйте `ChatType.DIALOG`.
 
 ## Command фильтр
 
@@ -69,19 +72,75 @@ async def callback_handler(event: MessageCallback, payload: MyPayload):
     await event.answer(f"Edit action: {payload.value}")
 ```
 
-## Комбинация фильтров
+## ContactFilter (сообщения с контактом)
+
+Фильтр срабатывает на `MessageCreated` и `MessageEdited`, если в сообщении есть
+вложение типа `contact`. При совпадении возвращает `dict` с ключом `contact`,
+который будет прокинут в хэндлер как аргумент.
 
 ```python
-# И (AND)
-F.message.body.text & F.message.chat.type == ChatType.PRIVATE
+from maxapi.filters.contact import ContactFilter
+from maxapi.types.attachments.contact import Contact
 
-# Или (OR)
-F.message.body.text | F.message.attachments
+
+@dp.message_created(ContactFilter())
+async def on_contact(event, contact: Contact):
+    # contact.payload.vcf_info — исходная VCF строка (не изменяется)
+    # contact.payload.vcf — высокоуровневый доступ к распарсенному vCard
+    full_name = contact.payload.vcf.full_name
+    phone = contact.payload.vcf.phone
+    await event.message.answer(f"{full_name=}, {phone=}")
+```
+
+Если нужно разобрать VCF вручную, можно использовать `parse_vcf_info`:
+
+```python
+from maxapi.utils.vcf import parse_vcf_info
+
+info = parse_vcf_info(contact.payload.vcf_info)
+print(info.full_name, info.phones)
+```
+
+## ChannelPostFilter (посты из канала)
+
+Фильтр срабатывает на `MessageCreated` и `MessageEdited`, если сообщение пришло
+из **канала** (то есть `recipient.chat_type == ChatType.CHANNEL`).
+
+```python
+from maxapi.filters.channel_post import ChannelPostFilter
+from maxapi.types import MessageCreated
+
+
+@dp.message_created(ChannelPostFilter())
+async def on_channel_post(event: MessageCreated):
+    await event.message.answer("Пост из канала получен")
+```
+
+## Комбинация фильтров
+
+!!! warning "Приоритет операторов"
+    Операторы `&` и `|` имеют **более высокий приоритет**, чем `==`.
+    Без скобок выражение `F.x == "a" | F.x == "b"` парсится как
+    `F.x == ("a" | F.x) == "b"` — что является ошибкой.
+    **Всегда оборачивайте** каждое сравнение в скобки.
+
+```python
+# И (AND) — скобки обязательны при использовании ==
+F.message.body.text & (F.message.chat.type == ChatType.DIALOG)
+
+# Или (OR) — скобки обязательны при использовании ==
+(F.callback.payload == "ru") | (F.callback.payload == "en")
+
+# Для множественных значений удобнее .in_()
+F.callback.payload.in_({"ru", "en"})
+
+# Проверка на истинность (без ==) — скобки не нужны
+F.message.body.text | F.message.body.attachments
 
 # Отрицание (NOT)
 ~F.message.body.text
 
-# Несколько фильтров в декораторе
+# Несколько фильтров в декораторе (все объединяются через AND)
 @dp.message_created(F.message.body.text, Command('start'), Form.name)
 async def handler(event: MessageCreated):
     ...

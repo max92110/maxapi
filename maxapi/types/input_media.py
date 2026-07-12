@@ -1,8 +1,57 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import puremagic
 
 from ..enums.upload_type import UploadType
+
+READ_FILE_CHUNK_SIZE = 4096
+
+
+def detect_file_type(data: bytes) -> UploadType:
+    """
+    Определяет тип файла на основе его содержимого (MIME-типа).
+
+    Args:
+        data: Буфер с содержимым файла.
+    Returns:
+        UploadType: Определенный тип файла. Если MIME-тип не удалось
+                    определить или при определении произошла ошибка,
+                    возвращается ``UploadType.FILE``.
+    """
+    try:
+        matches = puremagic.magic_string(data)
+        if matches:
+            mime_type = matches[0].mime_type
+        else:
+            mime_type = None
+    except Exception:
+        mime_type = None
+
+    if mime_type is None:
+        return UploadType.FILE
+    if mime_type.startswith("video/"):
+        return UploadType.VIDEO
+    elif mime_type.startswith("image/"):
+        return UploadType.IMAGE
+    elif mime_type.startswith("audio/"):
+        return UploadType.AUDIO
+    else:
+        return UploadType.FILE
+
+
+def validate_uploading_type(type: UploadType | str) -> UploadType:
+    if not isinstance(type, UploadType):
+        try:
+            return UploadType(type)
+        except ValueError as e:
+            allowed = ", ".join(item.value for item in UploadType)
+            raise ValueError(
+                f"Неверный тип загружаемого файла: {type!r}. Ожидается: {allowed}"  # noqa: E501
+            ) from e
+
+    return type
 
 
 class InputMedia:
@@ -10,55 +59,34 @@ class InputMedia:
     Класс для представления медиафайла.
 
     Attributes:
-        path (str): Путь к файлу.
-        type (UploadType): Тип файла, определенный на основе содержимого (MIME-типа).
+        path: Путь к файлу.
+        type: Тип файла, определенный на основе содержимого
+            (MIME-типа) или указанный вручную.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, type: UploadType | str | None = None):
         """
         Инициализирует объект медиафайла.
 
         Args:
-            path (str): Путь к файлу.
+            path: Путь к файлу.
+            type: Тип файла. Если не указан,
+                определяется автоматически.
         """
 
         self.path = path
-        self.type = self.__detect_file_type(path)
 
-    def __detect_file_type(self, path: str) -> UploadType:
-        """
-        Определяет тип файла на основе его содержимого (MIME-типа).
-
-        Args:
-            path (str): Путь к файлу.
-
-        Returns:
-            UploadType: Тип файла (VIDEO, IMAGE, AUDIO или FILE).
-        """
-
-        with open(path, "rb") as f:
-            sample = f.read(4096)
-
-        try:
-            matches = puremagic.magic_string(sample)
-            if matches:
-                mime_type = matches[0].mime_type
-            else:
-                mime_type = None
-        except Exception:
-            mime_type = None
-
-        if mime_type is None:
-            return UploadType.FILE
-
-        if mime_type.startswith("video/"):
-            return UploadType.VIDEO
-        elif mime_type.startswith("image/"):
-            return UploadType.IMAGE
-        elif mime_type.startswith("audio/"):
-            return UploadType.AUDIO
+        if type is not None:
+            self.type = validate_uploading_type(type)
         else:
-            return UploadType.FILE
+            self.type = detect_file_type(InputMedia._read_file_sample(path))
+
+    @staticmethod
+    def _read_file_sample(
+        path: str, size: int = READ_FILE_CHUNK_SIZE
+    ) -> bytes:
+        with Path(path).open("rb") as f:
+            return f.read(size)
 
 
 class InputMediaBuffer:
@@ -66,40 +94,32 @@ class InputMediaBuffer:
     Класс для представления медиафайла из буфера.
 
     Attributes:
-        buffer (bytes): Буфер с содержимым файла.
-        type (UploadType): Тип файла, определенный по содержимому.
+        buffer: Буфер с содержимым файла.
+        type: Тип файла, определенный на основе содержимого
+            (MIME-типа) или указанный вручную.
     """
 
-    def __init__(self, buffer: bytes, filename: str | None = None):
+    def __init__(
+        self,
+        buffer: bytes,
+        filename: str | None = None,
+        type: UploadType | str | None = None,
+    ):
         """
         Инициализирует объект медиафайла из буфера.
 
         Args:
-            buffer (IO): Буфер с содержимым файла.
-            filename (str): Название файла (по умолчанию присваивается uuid4).
+            buffer: Буфер с содержимым файла.
+            filename: Название файла (по умолчанию
+                присваивается uuid4).
+            type: Тип файла. Если не указан,
+                определяется автоматически.
         """
 
         self.filename = filename
         self.buffer = buffer
-        self.type = self.__detect_file_type(buffer)
 
-    def __detect_file_type(self, buffer: bytes) -> UploadType:
-        try:
-            matches = puremagic.magic_string(buffer)
-            if matches:
-                mime_type = matches[0].mime_type
-            else:
-                mime_type = None
-        except Exception:
-            mime_type = None
-
-        if mime_type is None:
-            return UploadType.FILE
-        if mime_type.startswith("video/"):
-            return UploadType.VIDEO
-        elif mime_type.startswith("image/"):
-            return UploadType.IMAGE
-        elif mime_type.startswith("audio/"):
-            return UploadType.AUDIO
+        if type is not None:
+            self.type = validate_uploading_type(type)
         else:
-            return UploadType.FILE
+            self.type = detect_file_type(buffer)

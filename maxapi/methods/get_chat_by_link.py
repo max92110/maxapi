@@ -1,5 +1,7 @@
-from re import findall
+import warnings
+from re import fullmatch
 from typing import TYPE_CHECKING, cast
+from urllib.parse import urlparse
 
 from ..connection.base import BaseConnection
 from ..enums.api_path import ApiPath
@@ -12,27 +14,50 @@ if TYPE_CHECKING:
 
 class GetChatByLink(BaseConnection):
     """
-    Класс для получения информации о чате по ссылке.
+    Класс для получения информации о канале по публичной ссылке.
+
+    .. deprecated:: 1.2.1
+        Метод удалён из текущей OpenAPI-спецификации API MAX.
+        Использование не рекомендуется.
 
     https://dev.max.ru/docs-api/methods/GET/chats/-chatLink-
 
     Attributes:
-        link (list[str]): Список валидных частей ссылки.
-        PATTERN_LINK (str): Регулярное выражение для парсинга ссылки.
+        link: Нормализованная публичная ссылка.
+        PATTERN_LINK: Регулярное выражение для парсинга ссылки.
     """
 
-    PATTERN_LINK = r"@?[a-zA-Z]+[a-zA-Z0-9-_]*"
+    PATTERN_LINK: str = r"@?[a-zA-Z]+[a-zA-Z0-9-_]*"
 
     def __init__(self, bot: "Bot", link: str):
-        self.bot = bot
-        self.link = findall(self.PATTERN_LINK, link)
+        warnings.warn(
+            "GetChatByLink устарел и отсутствует в текущей "
+            "OpenAPI-спецификации API MAX. "
+            "Использование не рекомендуется.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
-        if not self.link:
+        super().__init__()
+        self.bot = bot
+        self.link = self._normalize_link(link)
+
+        if fullmatch(self.PATTERN_LINK, self.link) is None:
             raise ValueError(f"link не соответствует {self.PATTERN_LINK!r}")
+
+    @staticmethod
+    def _normalize_link(link: str) -> str:
+        value = link.strip()
+        parsed = urlparse(value)
+
+        if parsed.scheme or parsed.netloc:
+            value = parsed.path.rstrip("/").rsplit("/", maxsplit=1)[-1]
+
+        return value
 
     async def fetch(self) -> Chat:
         """
-        Выполняет GET-запрос для получения данных чата по ссылке.
+        Выполняет GET-запрос для получения данных канала по ссылке.
 
         Returns:
             Chat: Объект с информацией о чате.
@@ -42,7 +67,7 @@ class GetChatByLink(BaseConnection):
 
         response = await super().request(
             method=HTTPMethod.GET,
-            path=ApiPath.CHATS.value + "/" + self.link[-1],
+            path=ApiPath.CHATS.value + "/" + self.link,
             model=Chat,
             params=bot.params,
         )

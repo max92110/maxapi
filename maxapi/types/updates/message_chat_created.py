@@ -1,11 +1,12 @@
 import warnings
-from typing import Optional
+from typing import Literal
 
+from ...enums.update import UpdateType
 from ...types.chats import Chat
-from .update import Update
+from .base_update import BaseUpdate
 
 
-class MessageChatCreated(Update):
+class MessageChatCreated(BaseUpdate):
     """
     .. deprecated:: 0.9.14
         Это событие устарело и будет удалено в будущих версиях.
@@ -13,16 +14,19 @@ class MessageChatCreated(Update):
     Событие создания чата.
 
     Attributes:
-        chat (Chat): Объект чата.
-        title (Optional[str]): Название чата.
-        message_id (Optional[str]): ID сообщения.
-        start_payload (Optional[str]): Payload для старта.
+        chat: Объект чата.
+        title: Название чата. Может быть None.
+        message_id: ID сообщения. Может быть None.
+        start_payload: Payload для старта. Может быть None.
     """
 
     chat: Chat  # type: ignore[assignment]
-    title: Optional[str] = None
-    message_id: Optional[str] = None
-    start_payload: Optional[str] = None
+    title: str | None = None
+    message_id: str | None = None
+    start_payload: str | None = None
+    update_type: Literal[UpdateType.MESSAGE_CHAT_CREATED] = (
+        UpdateType.MESSAGE_CHAT_CREATED
+    )
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -33,4 +37,4 @@ class MessageChatCreated(Update):
         )
 
     def get_ids(self):
-        return (self.chat.chat_id, self.chat.owner_id)
+        return self.chat.chat_id, self.chat.owner_id

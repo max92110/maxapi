@@ -1,24 +1,26 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+import time
+import warnings
+from typing import TYPE_CHECKING, Any, cast
 
 from ..connection.base import BaseConnection
 from ..enums.api_path import ApiPath
 from ..enums.http_method import HTTPMethod
-from ..enums.parse_mode import ParseMode
+from ..enums.parse_mode import ParseMode, TextFormat
 from ..exceptions.max import MaxApiError
 from ..loggers import logger_bot
-from ..types.attachments import Attachments
 from ..types.attachments.attachment import Attachment
 from ..types.attachments.upload import AttachmentUpload
 from ..types.input_media import InputMedia, InputMediaBuffer
-from ..types.message import NewMessageLink
 from ..utils.message import process_input_media
 from .types.edited_message import EditedMessage
 
 if TYPE_CHECKING:
     from ..bot import Bot
+    from ..types.attachments import Attachments
+    from ..types.message import NewMessageLink
 
 
 class EditMessage(BaseConnection):
@@ -28,47 +30,75 @@ class EditMessage(BaseConnection):
     https://dev.max.ru/docs-api/methods/PUT/messages
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        message_id (str): Идентификатор сообщения для редактирования.
-        text (Optional[str]): Новый текст сообщения.
-        attachments (Optional[List[Attachment | InputMedia | InputMediaBuffer]]):
+        bot: Экземпляр бота для выполнения запроса.
+        message_id: Идентификатор сообщения для редактирования.
+        text: Новый текст сообщения.
+        attachments:
             Список вложений для сообщения.
-        link (Optional[NewMessageLink]): Связь с другим сообщением (например, ответ или пересылка).
-        notify (Optional[bool]): Отправлять ли уведомление о сообщении. По умолчанию True.
-        parse_mode (Optional[ParseMode]): Формат разметки текста (например, Markdown, HTML).
+        link: Связь с другим сообщением
+            (например, ответ или пересылка).
+        notify: Отправлять ли уведомление о сообщении.
+            По умолчанию True.
+        format: Формат разметки текста
+            (например, Markdown, HTML).
+        parse_mode: Устаревший формат разметки текста
+            (например, Markdown, HTML).
     """
 
     def __init__(
         self,
         bot: Bot,
         message_id: str,
-        text: Optional[str] = None,
-        attachments: Optional[
-            List[Attachment | InputMedia | InputMediaBuffer | AttachmentUpload]
-            | List[Attachments]
-        ] = None,
-        link: Optional[NewMessageLink] = None,
-        notify: Optional[bool] = None,
-        parse_mode: Optional[ParseMode] = None,
-        sleep_after_input_media: Optional[bool] = True,
+        text: str | None = None,
+        attachments: list[
+            Attachment | InputMedia | InputMediaBuffer | AttachmentUpload
+        ]
+        | list[Attachments]
+        | None = None,
+        link: NewMessageLink | None = None,
+        format: TextFormat | None = None,
+        parse_mode: ParseMode | None = None,
+        *,
+        notify: bool | None = None,
+        sleep_after_input_media: bool | None = True,
     ):
-        if text is not None and not (len(text) < 4000):
+        if text is not None and len(text) >= 4000:
             raise ValueError("text должен быть меньше 4000 символов")
 
+        super().__init__()
         self.bot = bot
         self.message_id = message_id
         self.text = text
         self.attachments = attachments
         self.link = link
         self.notify = notify
-        self.parse_mode = parse_mode
+        if parse_mode is not None:
+            warnings.warn(
+                "Параметр parse_mode устарел, используйте format.",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+        # Поддержка передачи строки вместо enum для обратной
+        # совместимости: пользователь может передать "html" или
+        # TextFormat.HTML — внутри всегда храним enum, чтобы .value
+        # работал без ошибок.
+        if isinstance(format, str) and not isinstance(format, TextFormat):
+            format = TextFormat(format)
+        if isinstance(parse_mode, str) and not isinstance(
+            parse_mode, ParseMode
+        ):
+            parse_mode = ParseMode(parse_mode)
+        self.format: TextFormat | None = (
+            format if format is not None else parse_mode
+        )
         self.sleep_after_input_media = sleep_after_input_media
 
-    async def fetch(self) -> Optional[EditedMessage]:
+    async def fetch(self) -> EditedMessage | None:
         """
         Выполняет PUT-запрос для обновления сообщения.
 
-        Формирует тело запроса на основе переданных параметров и отправляет запрос к API.
+        Формирует тело запроса на основе переданных параметров и
+        отправляет запрос к API.
 
         Returns:
             EditedMessage: Обновлённое сообщение.
@@ -78,21 +108,19 @@ class EditMessage(BaseConnection):
 
         params = bot.params.copy()
 
-        json: Dict[str, Any] = {"attachments": []}
+        json: dict[str, Any] = {"attachments": []}
 
         params["message_id"] = self.message_id
 
         if self.text is not None:
             json["text"] = self.text
 
-        HAS_INPUT_MEDIA = False
+        has_input_media = False
 
         if self.attachments:
             for att in self.attachments:
-                if isinstance(att, InputMedia) or isinstance(
-                    att, InputMediaBuffer
-                ):
-                    HAS_INPUT_MEDIA = True
+                if isinstance(att, (InputMedia, InputMediaBuffer)):
+                    has_input_media = True
 
                     input_media = await process_input_media(
                         base_connection=self, bot=bot, att=att
@@ -109,15 +137,20 @@ class EditMessage(BaseConnection):
             json["link"] = self.link.model_dump()
         if self.notify is not None:
             json["notify"] = self.notify
-        if self.parse_mode is not None:
-            json["format"] = self.parse_mode.value
+        if self.format is not None:
+            json["format"] = self.format
 
-        if HAS_INPUT_MEDIA and self.sleep_after_input_media:
+        if has_input_media and self.sleep_after_input_media:
             await asyncio.sleep(bot.after_input_media_delay)
+
+        attempts = bot.after_upload_attempts
+        retry_delay = bot.after_upload_retry_delay
+        give_up_timeout = bot.after_upload_give_up_timeout
 
         response = None
 
-        for attempt in range(self.ATTEMPTS_COUNT):
+        start_time = time.monotonic()
+        for attempt in range(attempts):
             try:
                 response = await super().request(
                     method=HTTPMethod.PUT,
@@ -127,16 +160,34 @@ class EditMessage(BaseConnection):
                     json=json,
                 )
             except MaxApiError as e:
-                if "attachment.not.ready" in e.raw:
+                if (
+                    isinstance(e.raw, dict)
+                    and e.raw.get("code") == "attachment.not.ready"
+                ):
+                    elapsed = time.monotonic() - start_time
+                    if (
+                        give_up_timeout is not None
+                        and elapsed + retry_delay > give_up_timeout
+                    ):
+                        raise RuntimeError(
+                            f"Превышено максимальное время ожидания"
+                            f" готовности медиа"
+                            f" ({give_up_timeout}с),"
+                            f" прошло {elapsed:.1f}с"
+                        ) from e
                     logger_bot.info(
-                        f"Ошибка при отправке загруженного медиа, попытка {attempt + 1}, жду {self.RETRY_DELAY} секунды"
+                        f"Ошибка при отправке загруженного медиа,"
+                        f" попытка {attempt + 1},"
+                        f" жду {retry_delay} секунды"
                     )
-                    await asyncio.sleep(self.RETRY_DELAY)
+                    await asyncio.sleep(retry_delay)
                     continue
+                else:
+                    raise e
 
             break
 
         if response is None:
             raise RuntimeError("Не удалось отредактировать сообщение")
 
-        return cast(Optional[EditedMessage], response)
+        return cast(EditedMessage | None, response)

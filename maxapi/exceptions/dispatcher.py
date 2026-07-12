@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -9,8 +9,9 @@ class HandlerException(Exception):
     handler_title: str
     router_id: str | int | None
     process_info: str
-    memory_context: Dict[str, Any]
-    cause: Optional[BaseException] = None
+    memory_context: dict[str, Any]
+    cause: BaseException | None = None
+    router: Any | None = None
 
     def __str__(self) -> str:
         parts = [
@@ -25,14 +26,16 @@ class HandlerException(Exception):
             )
         return "HandlerException(" + ", ".join(parts) + ")"
 
+    __repr__ = __str__
+
 
 @dataclass(slots=True)
 class MiddlewareException(Exception):
     middleware_title: str
     router_id: str | int | None
     process_info: str
-    memory_context: Dict[str, Any]
-    cause: Optional[BaseException] = None
+    memory_context: dict[str, Any]
+    cause: BaseException | None = None
 
     def __str__(self) -> str:
         parts = [
@@ -46,3 +49,5 @@ class MiddlewareException(Exception):
                 f"cause={self.cause.__class__.__name__}: {self.cause}"
             )
         return "MiddlewareException(" + ", ".join(parts) + ")"
+
+    __repr__ = __str__

@@ -1,8 +1,7 @@
 import pytest
-
+from maxapi.enums.chat_type import ChatType
 from maxapi.types.message import Message, Recipient
 from maxapi.types.users import User
-from maxapi.enums.chat_type import ChatType
 
 
 @pytest.fixture
@@ -11,40 +10,42 @@ def recipient():
 
 
 def make_message_with_no_body(recipient):
-    user = User(user_id=10, first_name="Test", is_bot=False, last_activity_time=1)
+    user = User(
+        user_id=10, first_name="Test", is_bot=False, last_activity_time=1
+    )
     return Message(sender=user, recipient=recipient, timestamp=1, body=None)
 
 
 async def test_reply_raises_when_body_none(recipient):
     msg = make_message_with_no_body(recipient)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="поле body отсутствует"):
         await msg.reply()
 
 
 async def test_forward_raises_when_body_none(recipient):
     msg = make_message_with_no_body(recipient)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="поле body отсутствует"):
         await msg.forward(chat_id=3)
 
 
 async def test_edit_raises_when_body_none(recipient):
     msg = make_message_with_no_body(recipient)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="поле body отсутствует"):
         await msg.edit(text="x")
 
 
 async def test_delete_raises_when_body_none(recipient):
     msg = make_message_with_no_body(recipient)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="поле body отсутствует"):
         await msg.delete()
 
 
 async def test_pin_raises_when_body_none(recipient):
     msg = make_message_with_no_body(recipient)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="поле body отсутствует"):
         await msg.pin()

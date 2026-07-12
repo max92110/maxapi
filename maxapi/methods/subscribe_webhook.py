@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+import warnings
+from typing import TYPE_CHECKING, Any, cast
 
 from ..connection.base import BaseConnection
 from ..enums.api_path import ApiPath
@@ -13,29 +14,51 @@ if TYPE_CHECKING:
 class SubscribeWebhook(BaseConnection):
     """
     Подписывает бота на получение обновлений через WebHook.
-    После вызова этого метода бот будет получать уведомления о новых событиях в чатах на указанный URL.
-    Ваш сервер должен прослушивать один из следующих портов: `80`, `8080`, `443`, `8443`, `16384`-`32383`.
+    После вызова этого метода бот будет получать уведомления о новых
+    событиях в чатах на указанный URL.
+    Ваш сервер должен прослушивать один из следующих портов:
+    `80`, `8080`, `443`, `8443`, `16384`-`32383`.
+
+    .. warning::
+        Требования безопасности (с 25.05.2026): прекращается поддержка
+        получения вебхуков по HTTP, а также самоподписных сертификатов.
+        Используйте HTTPS и сертификаты, выданные доверенным центром
+        сертификации.
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        url (str): URL HTTP(S)-эндпойнта вашего бота. Должен начинаться с http(s)://
-        update_types (Optional[List[str]]): Список типов обновлений, которые ваш бот хочет получать. Для полного списка типов см. объект
-        secret (Optional[str]): От 5 до 256 символов. Cекрет, который должен быть отправлен в заголовке X-Max-Bot-Api-Secret в каждом запросе Webhook.
-            Разрешены только символы A-Z, a-z, 0-9, и дефис. Заголовок рекомендован, чтобы запрос поступал из установленного веб-узла
+        bot: Экземпляр бота для выполнения запроса.
+        url: URL HTTP(S)-эндпойнта вашего бота. Должен начинаться
+            с http(s)://
+        update_types: Список типов обновлений,
+            которые ваш бот хочет получать. Для полного списка типов
+            см. объект
+        secret: От 5 до 256 символов. Секрет, который
+            должен быть отправлен в заголовке X-Max-Bot-Api-Secret в
+            каждом запросе Webhook. Разрешены только символы A-Z, a-z,
+            0-9, и дефис. Заголовок рекомендован, чтобы запрос поступал
+            из установленного веб-узла
     """
 
     def __init__(
         self,
         bot: "Bot",
         url: str,
-        update_types: Optional[List[UpdateType]] = None,
-        secret: Optional[str] = None,
+        update_types: list[UpdateType] | None = None,
+        secret: str | None = None,
     ):
         if secret is not None and not (5 <= len(secret) <= 256):
             raise ValueError(
                 "secret не должен быть меньше 5 или больше 256 символов"
             )
 
+        if url.startswith("http://"):
+            warnings.warn(
+                "URL вебхука не использует HTTPS. "
+                "Обновления будут передаваться по незашифрованному каналу.",
+                stacklevel=2,
+            )
+
+        super().__init__()
         self.bot = bot
         self.url = url
         self.update_types = update_types
@@ -43,7 +66,8 @@ class SubscribeWebhook(BaseConnection):
 
     async def fetch(self) -> Subscribed:
         """
-        Отправляет запрос на подписку бота на получение обновлений через WebHook
+        Отправляет запрос на подписку бота на получение обновлений
+        через WebHook.
 
         Returns:
             Subscribed: Объект с информацией об операции
@@ -51,7 +75,7 @@ class SubscribeWebhook(BaseConnection):
 
         bot = self._ensure_bot()
 
-        json: Dict[str, Any] = {}
+        json: dict[str, Any] = {}
 
         json["url"] = self.url
 

@@ -2,65 +2,87 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
+import warnings
 from asyncio.exceptions import TimeoutError as AsyncioTimeoutError
+from collections import OrderedDict
+from collections.abc import Hashable
 from datetime import datetime
-from re import DOTALL, search
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Awaitable,
-    Callable,
-    Dict,
-    List,
-    Literal,
-    Optional,
-)
+from typing import TYPE_CHECKING, Any, cast
+from warnings import warn
 
 from aiohttp import ClientConnectorError
 
-from .bot import Bot
-from .context import MemoryContext
+from .context import BaseContext, ContextManager, MemoryContext
 from .enums.update import UpdateType
 from .exceptions.dispatcher import HandlerException, MiddlewareException
 from .exceptions.max import InvalidToken, MaxApiError, MaxConnection
 from .filters import filter_attrs
-from .filters.command import CommandsInfo
-from .filters.filter import BaseFilter
-from .filters.handler import Handler
-from .filters.middleware import BaseMiddleware
+from .filters.handler import ErrorHandler, Handler
 from .loggers import logger_dp
-from .methods.types.getted_updates import (
-    process_update_request,
-    process_update_webhook,
-)
+from .methods.types.getted_updates import process_update_request
 from .types.bot_mixin import BotMixin
-from .types.updates import UpdateUnion
-
-try:
-    from fastapi import FastAPI, Request  # type: ignore
-    from fastapi.responses import JSONResponse  # type: ignore
-
-    FASTAPI_INSTALLED = True
-except ImportError:
-    FASTAPI_INSTALLED = False
-
-
-try:
-    from uvicorn import Config, Server  # type: ignore
-
-    UVICORN_INSTALLED = True
-except ImportError:
-    UVICORN_INSTALLED = False
-
+from .types.error_event import ErrorEvent as ErrorEventObject
+from .utils.commands import extract_commands
+from .utils.time import from_ms, to_ms
+from .webhook import DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT, BaseMaxWebhook
+from .webhook.aiohttp import AiohttpMaxWebhook
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
     from magic_filter import MagicFilter
+
+    from .bot import Bot
+    from .filters.filter import BaseFilter
+    from .filters.middleware import BaseMiddleware, HandlerCallable
+    from .types.updates import UpdateUnion
 
 CONNECTION_RETRY_DELAY = 30
 GET_UPDATES_RETRY_DELAY = 5
-COMMANDS_INFO_PATTERN = r"commands_info:\s*(.*?)(?=\n|$)"
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 8080
+CONTEXTS_MAX_SIZE = 10_000
+
+_FilterKwargSpec = tuple[str | None, frozenset[str] | None]
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_filter_kwarg_spec(filter_cls: Any) -> _FilterKwargSpec:
+    """Возвращает имя event-аргумента и допустимые kwargs для фильтра."""
+    try:
+        signature = inspect.signature(filter_cls.__call__)
+    except (TypeError, ValueError):
+        return None, frozenset()
+
+    params = list(signature.parameters.values())
+    event_arg_name: str | None = None
+    event_param_skipped = False
+    allowed_kwargs: set[str] = set()
+
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            continue
+
+        if not event_param_skipped and param.name == "self":
+            continue
+
+        if not event_param_skipped and param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            event_arg_name = param.name
+            event_param_skipped = True
+            continue
+
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return event_arg_name, None
+
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            allowed_kwargs.add(param.name)
+
+    return event_arg_name, frozenset(allowed_kwargs)
 
 
 class Dispatcher(BotMixin):
@@ -74,52 +96,65 @@ class Dispatcher(BotMixin):
     def __init__(
         self,
         router_id: str | None = None,
+        storage: Any = MemoryContext,
+        *,
         use_create_task: bool = False,
-        context_factory: Callable[..., MemoryContext] | None = None,
-        context_kwargs: Optional[Dict[str, Any]] = None,
-        redis_client: Any | None = None,
-        redis_prefix: str = "maxapi:context",
-        redis_ttl: int | None = None,
+        **storage_kwargs: Any,
     ) -> None:
         """
         Инициализация диспетчера.
 
         Args:
-            router_id (str | None): Идентификатор роутера для логов.
-            use_create_task (bool): Флаг, отвечающий за параллелизацию обработок событий.
-            context_factory (Callable): Фабрика для создания контекстов памяти.
-            context_kwargs (dict | None): Дополнительные аргументы для контекста.
-            redis_client (Any | None): Экземпляр redis.asyncio.Redis для хранения контекста.
-            redis_prefix (str): Префикс ключей Redis.
-            redis_ttl (int | None): Время жизни ключей контекста в секундах.
+            router_id: Идентификатор роутера для логов.
+            use_create_task: Флаг, отвечающий за параллелизацию
+                обработок событий.
+            storage: Класс контекста для хранения
+                данных (MemoryContext, RedisContext и т.д.).
+            **storage_kwargs: Дополнительные аргументы для
+                инициализации хранилища.
         """
 
         self.router_id = router_id
+        self.storage = storage
+        self.storage_kwargs = storage_kwargs
+        self._fsm = ContextManager(self, self.__get_context)
 
-        self.event_handlers: List[Handler] = []
-        self.contexts: List[MemoryContext] = []
-        self.routers: List[Router | Dispatcher] = []
-        self.filters: List[MagicFilter] = []
-        self.base_filters: List[BaseFilter] = []
-        self.middlewares: List[BaseMiddleware] = []
+        self.event_handlers: list[Handler] = []
+        self.error_handlers: list[ErrorHandler] = []
+        self.handlers_by_type: dict[UpdateType, list[Handler]] | None = None
+        self.contexts: OrderedDict[
+            tuple[int | None, int | None], BaseContext
+        ] = OrderedDict()
+        self.routers: list[Router | Dispatcher] = []
+        self.filters: list[MagicFilter] = []
+        self.base_filters: list[BaseFilter] = []
+        self.outer_middlewares: list[BaseMiddleware] = []
+        self.inner_middlewares: list[BaseMiddleware] = []
 
-        self.bot: Optional[Bot] = None
-        self.webhook_app: Optional[FastAPI] = None
-        self.on_started_func: Optional[Callable] = None
+        self.bot: Bot | None = None
+        self.on_started_func: Callable | None = None
         self.polling = False
         self.use_create_task = use_create_task
-        self.context_factory = context_factory or MemoryContext
-        self.context_kwargs = context_kwargs or {}
-
-        if redis_client:
-            self.context_kwargs.setdefault("redis_client", redis_client)
-            self.context_kwargs.setdefault("redis_prefix", redis_prefix)
-            if redis_ttl:
-                self.context_kwargs.setdefault("redis_ttl", redis_ttl)
+        self._cached_router_entries: (
+            list[
+                tuple[
+                    Router | Dispatcher,
+                    list[BaseMiddleware],
+                    list[MagicFilter],
+                    list[BaseFilter],
+                ]
+            ]
+            | None
+        ) = None
+        self._global_mw_chain: HandlerCallable | None = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._ready: bool = False
 
         self.message_created = Event(
             update_type=UpdateType.MESSAGE_CREATED, router=self
         )
+        self.errors = ErrorEventObserver(router=self)
+        self.error = self.errors
         self.bot_added = Event(update_type=UpdateType.BOT_ADDED, router=self)
         self.bot_removed = Event(
             update_type=UpdateType.BOT_REMOVED, router=self
@@ -168,48 +203,74 @@ class Dispatcher(BotMixin):
         )
         self.on_started = Event(update_type=UpdateType.ON_STARTED, router=self)
 
-    def webhook_post(self, path: str):
-        def decorator(func):
-            if self.webhook_app is None:
-                try:
-                    from fastapi import FastAPI  # type: ignore
-                except ImportError:
-                    raise ImportError(
-                        "\n\t Не установлен fastapi!"
-                        "\n\t Выполните команду для установки fastapi: "
-                        "\n\t pip install fastapi>=0.68.0"
-                        "\n\t Или сразу все зависимости для работы вебхука:"
-                        "\n\t pip install maxapi[webhook]"
-                    )
-                self.webhook_app = FastAPI()
-            return self.webhook_app.post(path)(func)
+    @property
+    def fsm(self) -> ContextManager:
+        """
+        Менеджер FSM-контекстов диспетчера.
+        """
+        return self._fsm
 
-        return decorator
+    @property
+    def middlewares(self) -> list[BaseMiddleware]:
+        """
+        Список outer-middleware.
 
-    async def check_me(self):
+        .. deprecated::
+            Используйте :attr:`outer_middlewares`.
+        """
+        warnings.warn(
+            f"{type(self).__name__}.middlewares устарел. "
+            "Используйте outer_middlewares.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.outer_middlewares
+
+    @middlewares.setter
+    def middlewares(self, value: list[BaseMiddleware]) -> None:
+        """
+        Устанавливает outer_middlewares через устаревший атрибут.
+
+        .. deprecated::
+            Присвоение ``dp.middlewares = [...]`` устарело.
+            Используйте :attr:`outer_middlewares` напрямую.
+        """
+        warnings.warn(
+            f"{type(self).__name__}.middlewares = [...] устарел. "
+            "Используйте outer_middlewares.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.outer_middlewares = value
+
+    async def check_me(self) -> None:
         """
         Проверяет и логирует информацию о боте.
         """
 
-        me = await self._ensure_bot().get_me()
+        bot = self._ensure_bot()
+        me = await bot.get_me()
 
-        self._ensure_bot()._me = me
+        bot.me = me
 
         logger_dp.info(
-            f"Бот: @{me.username} first_name={me.first_name} id={me.user_id}"
+            "Бот: @%s first_name=%s id=%s",
+            me.username,
+            me.first_name,
+            me.user_id,
         )
 
+    @staticmethod
     def build_middleware_chain(
-        self,
-        middlewares: List[BaseMiddleware],
-        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
-    ) -> Callable[[Any, Dict[str, Any]], Awaitable[Any]]:
+        middlewares: list[BaseMiddleware],
+        handler: HandlerCallable,
+    ) -> HandlerCallable:
         """
         Формирует цепочку вызова middleware вокруг хендлера.
 
         Args:
-            middlewares (List[BaseMiddleware]): Список middleware.
-            handler (Callable): Финальный обработчик.
+            middlewares: Список middleware.
+            handler: Финальный обработчик.
 
         Returns:
             Callable: Обёрнутый обработчик.
@@ -220,307 +281,709 @@ class Dispatcher(BotMixin):
 
         return handler
 
-    def include_routers(self, *routers: "Router"):
+    def include_routers(self, *routers: Router) -> None:
         """
         Добавляет указанные роутеры в диспетчер.
 
         Args:
-            *routers (Router): Роутеры для добавления.
+            *routers: Роутеры для добавления.
         """
 
-        self.routers += [r for r in routers]
+        self.routers.extend(routers)
 
-    def outer_middleware(self, middleware: BaseMiddleware) -> None:
+    def register_outer_middleware(self, middleware: BaseMiddleware) -> None:
         """
-        Добавляет Middleware на первое место в списке.
+        Регистрирует outer middleware (до проверки фильтров handler).
+
+        Вызывается для каждого подходящего события ещё до того, как
+        диспетчер узнает, какой именно handler сработает.
+
+        Порядок регистрации сохраняется: первый зарегистрированный
+        outer middleware выполняется первым (внешний слой цепочки),
+        что симметрично с :meth:`register_inner_middleware`.
+
+        Args:
+            middleware: Middleware.
+        """
+        self.outer_middlewares.append(middleware)
+
+    def register_inner_middleware(self, middleware: BaseMiddleware) -> None:
+        """
+        Регистрирует inner middleware (после проверки фильтров handler).
+
+        Вызывается только тогда, когда конкретный handler прошёл все
+        свои фильтры и state и будет реально исполнен. На уровне
+        Dispatcher — только для событий, попавших хоть в один handler;
+        на уровне Router — только для handler этого роутера.
 
         Args:
             middleware (BaseMiddleware): Middleware.
         """
+        self.inner_middlewares.append(middleware)
 
-        self.middlewares.insert(0, middleware)
+    def outer_middleware(self, middleware: BaseMiddleware) -> None:
+        """
+        Добавляет Middleware на первое место в списке outer_middlewares.
+
+        Историческое поведение: ``insert(0, ...)``. В новом
+        :meth:`register_outer_middleware` порядок изменён на ``append``
+        (register order = execution order), поэтому при миграции
+        проверьте порядок вызовов, если он важен.
+
+        .. deprecated::
+            Используйте :meth:`register_outer_middleware`.
+
+        Args:
+            middleware (BaseMiddleware): Middleware.
+        """
+        warnings.warn(
+            f"{type(self).__name__}.outer_middleware() устарел. "
+            "Используйте register_outer_middleware().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.outer_middlewares.insert(0, middleware)
 
     def middleware(self, middleware: BaseMiddleware) -> None:
         """
         Добавляет Middleware в конец списка.
 
-        Args:
-            middleware (BaseMiddleware): Middleware.
-        """
+        .. deprecated::
+            Используйте :meth:`register_outer_middleware` (текущее
+            поведение — outer, до фильтров handler) или
+            :meth:`register_inner_middleware` (только когда handler
+            реально вызван).
 
-        self.middlewares.append(middleware)
+        Args:
+            middleware: Middleware.
+        """
+        warnings.warn(
+            f"{type(self).__name__}.middleware() устарел. "
+            "Используйте register_outer_middleware() (поведение "
+            "сохраняется) или register_inner_middleware() для запуска "
+            "mw только после выбора handler.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.outer_middlewares.append(middleware)
 
     def filter(self, base_filter: BaseFilter) -> None:
         """
         Добавляет фильтр в список.
 
         Args:
-            base_filter (BaseFilter): Фильтр.
+            base_filter: Фильтр.
         """
 
         self.base_filters.append(base_filter)
 
-    async def __ready(self, bot: Bot):
+    async def __ready(self, bot: Bot) -> None:
         """
-        Подготавливает диспетчер: сохраняет бота, регистрирует обработчики, вызывает on_started.
+        Подготавливает диспетчер: сохраняет бота, подготавливает
+        обработчики, вызывает on_started.
 
         Args:
-            bot (Bot): Экземпляр бота.
+            bot: Экземпляр бота.
         """
+
+        if self._ready:
+            return
 
         self.bot = bot
         self.bot.dispatcher = self
 
-        if self.polling and self.bot.auto_check_subscriptions:
-            response = await self.bot.get_subscriptions()
-
-            if response.subscriptions:
-                logger_subscriptions_text = ", ".join(
-                    [s.url for s in response.subscriptions]
-                )
-                logger_dp.warning(
-                    "БОТ ИГНОРИРУЕТ POLLING! Обнаружены установленные подписки: %s",
-                    logger_subscriptions_text,
-                )
+        if self.polling and bot.auto_check_subscriptions:
+            await self._check_subscriptions(bot)
 
         await self.check_me()
 
-        self.routers += [self]
+        if self not in self.routers:
+            self.routers.append(self)
+        self._prepare_handlers(bot)
 
-        for router in self.routers:
-            router.bot = bot
-
-            for handler in router.event_handlers:
-                if handler.base_filters is None:
-                    continue
-
-                for base_filter in handler.base_filters:
-                    commands = getattr(base_filter, "commands", None)
-
-                    if commands and type(commands) is list:
-                        handler_doc = handler.func_event.__doc__
-                        extracted_info = None
-
-                        if handler_doc:
-                            from_pattern = search(
-                                COMMANDS_INFO_PATTERN, handler_doc, DOTALL
-                            )
-                            if from_pattern:
-                                extracted_info = from_pattern.group(1).strip()
-
-                        self.bot.commands.append(
-                            CommandsInfo(commands, extracted_info)
-                        )
-
-        handlers_count = sum(
-            len(router.event_handlers) for router in self.routers
+        self._global_mw_chain = self.build_middleware_chain(
+            self.outer_middlewares, self._process_event
         )
-
-        logger_dp.info(f"{handlers_count} событий на обработку")
 
         if self.on_started_func:
             await self.on_started_func()
 
-    def __get_memory_context(
-        self, chat_id: Optional[int], user_id: Optional[int]
-    ) -> MemoryContext:
+        self._ready = True
+
+    def _prepare_handlers(self, bot: Bot) -> None:
+        """Подготовить обработчики событий и построить кеши."""
+
+        handlers_count = 0
+        global_inner_mw = self.inner_middlewares
+
+        for router, _, accumulated_inner_mw, *_ in self._iter_unique_routers(
+            self.routers, warn_duplicates=True
+        ):
+            router.bot = bot
+            router.handlers_by_type = {}
+
+            for handler in router.event_handlers:
+                handlers_count += 1
+                extract_commands(handler, bot)
+
+                handler.func_args = frozenset(
+                    inspect.signature(handler.func_event).parameters,
+                )
+
+                all_inner = (
+                    global_inner_mw
+                    + accumulated_inner_mw
+                    + handler.middlewares
+                )
+                handler.mw_chain = self.build_middleware_chain(
+                    all_inner,
+                    functools.partial(self.call_handler, handler),
+                )
+                router.handlers_by_type.setdefault(
+                    handler.update_type, []
+                ).append(handler)
+
+            for error_handler in router.error_handlers:
+                error_handler.func_args = frozenset(
+                    inspect.signature(error_handler.func_event).parameters,
+                )
+
+        self._cached_router_entries = self._build_dispatch_entries()
+
+        logger_dp.info(
+            "Зарегистрировано %d обработчиков событий", handlers_count
+        )
+
+    def _iter_dispatch_entries(
+        self,
+    ) -> Iterator[
+        tuple[
+            Router | Dispatcher,
+            list[BaseMiddleware],
+            list[MagicFilter],
+            list[BaseFilter],
+        ]
+    ]:
+        """Ленивый генератор entries для dispatch.
+
+        Используется когда ``_ready=False`` — позволяет остановить обход
+        дерева роутеров сразу после первого совпадения, не аллоцируя
+        полный список.  Inner-middleware уже выпечены в
+        ``handler.mw_chain`` в :meth:`_prepare_handlers`, поэтому в
+        кортеж попадают только ``(router, outer_mw, filters,
+        base_filters)``.
         """
-        Возвращает существующий или создаёт новый MemoryContext по chat_id и user_id.
+        for (
+            router,
+            outer_mw,
+            _inner_mw,
+            filters,
+            base_filters,
+        ) in self._iter_unique_routers(self.routers):
+            yield router, outer_mw, filters, base_filters
+
+    def _build_dispatch_entries(
+        self,
+    ) -> list[
+        tuple[
+            Router | Dispatcher,
+            list[BaseMiddleware],
+            list[MagicFilter],
+            list[BaseFilter],
+        ]
+    ]:
+        """Материализует полный список entries для кеша горячего пути.
+
+        Вызывается один раз при ``_ready=True`` и результат сохраняется в
+        ``_cached_router_entries``. Для ``_ready=False`` используйте
+        :meth:`_iter_dispatch_entries`.
+        """
+        return list(self._iter_dispatch_entries())
+
+    @staticmethod
+    async def _check_subscriptions(bot: Bot) -> None:
+        """Проверить наличие подписок при запуске polling."""
+        response = await bot.get_subscriptions()
+
+        if subscriptions := response.subscriptions:
+            logger_subscriptions_text = ", ".join(
+                [s.url for s in subscriptions]
+            )
+            logger_dp.warning(
+                "БОТ ИГНОРИРУЕТ POLLING! "
+                "Обнаружены установленные подписки: %s",
+                logger_subscriptions_text,
+            )
+
+    def __get_context(
+        self, chat_id: int | None, user_id: int | None
+    ) -> BaseContext:
+        """
+        Возвращает существующий или создаёт новый контекст
+        по chat_id и user_id.
 
         Args:
-            chat_id (Optional[int]): Идентификатор чата.
-            user_id (Optional[int]): Идентификатор пользователя.
+            chat_id: Идентификатор чата.
+            user_id: Идентификатор пользователя.
 
         Returns:
-            MemoryContext: Контекст.
+            Контекст.
         """
 
-        for ctx in self.contexts:
-            if ctx.chat_id == chat_id and ctx.user_id == user_id:
+        key = (chat_id, user_id)
+        ctx = self.contexts.get(key)
+        if ctx is not None:
+            if ctx.is_ttl_expired():
+                logger_dp.debug("Истёк TTL контекста %s", key)
+                del self.contexts[key]
+            else:
+                ctx.touch_ttl()
+                # Перемещаем в конец, чтобы LRU-вытеснение удаляло
+                # самые давно неиспользованные контексты
+                self.contexts.move_to_end(key)
                 return ctx
 
-        new_ctx = self.context_factory(
-            chat_id, user_id, **self.context_kwargs
-        )
-        self.contexts.append(new_ctx)
+        if len(self.contexts) >= CONTEXTS_MAX_SIZE:
+            evicted_key = next(iter(self.contexts))
+            logger_dp.debug(
+                "Вытеснен контекст %s (лимит %d)",
+                evicted_key,
+                CONTEXTS_MAX_SIZE,
+            )
+            self.contexts.popitem(last=False)
+
+        new_ctx = self.storage(chat_id, user_id, **self.storage_kwargs)
+        new_ctx.touch_ttl()
+        self.contexts[key] = new_ctx
         return new_ctx
 
+    @staticmethod
     async def call_handler(
-        self,
         handler: Handler,
-        event_object: UpdateType | Dict[str, Any],
-        data: Dict[str, Any],
+        event_object: UpdateUnion | dict[str, Any],
+        data: dict[str, Any],
     ) -> None:
         """
         Вызывает хендлер с нужными аргументами.
 
+        Перед вызовом фильтрует ``data``, оставляя только те ключи,
+        которые handler реально принимает (по ``handler.func_args`` или
+        параметрам, полученным через :func:`inspect.signature`).
+        В отличие от ``get_annotations``, ``signature`` не включает
+        ``"return"`` и не требует eval строковых аннотаций — безопасен
+        при ``from __future__ import annotations``. Несовместимые ключи
+        не дойдут до handler и не приведут к ``TypeError``.
+
         Args:
             handler: Handler.
             event_object: Объект события.
-            data: Данные для хендлера.
+            data: Данные, накопленные фильтрами и middleware.
 
         Returns:
             None
         """
+        if data:
+            func_args = handler.func_args or frozenset(
+                inspect.signature(handler.func_event).parameters,
+            )
+            kwargs = {k: v for k, v in data.items() if k in func_args}
+            if kwargs:
+                await handler.func_event(event_object, **kwargs)
+                return
 
-        func_args = handler.func_event.__annotations__.keys()
-        kwargs_filtered = {k: v for k, v in data.items() if k in func_args}
+        await handler.func_event(event_object)
 
-        if kwargs_filtered:
-            await handler.func_event(event_object, **kwargs_filtered)
-        else:
-            await handler.func_event(event_object)
+    @staticmethod
+    async def call_error_handler(
+        handler: ErrorHandler,
+        event_object: ErrorEventObject,
+        data: dict[str, Any],
+    ) -> None:
+        """
+        Вызывает обработчик ошибки с подходящими kwargs.
 
+        Args:
+            handler: Обработчик ошибки.
+            event_object: Событие ошибки.
+            data: Данные, накопленные фильтрами.
+        """
+        if data:
+            func_args = handler.func_args or frozenset(
+                inspect.signature(handler.func_event).parameters,
+            )
+            kwargs = {k: v for k, v in data.items() if k in func_args}
+            if kwargs:
+                await handler.func_event(event_object, **kwargs)
+                return
+
+        await handler.func_event(event_object)
+
+    @staticmethod
+    def _resolve_filter_kwargs(
+        base_filter: BaseFilter, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Подбирает kwargs для BaseFilter по сигнатуре ``__call__``.
+        """
+        event_arg_name, allowed_kwargs = _get_filter_kwarg_spec(
+            cast(Hashable, type(base_filter))
+        )
+
+        if allowed_kwargs is None:
+            return {
+                key: value
+                for key, value in data.items()
+                if key != event_arg_name
+            }
+
+        return {
+            key: value for key, value in data.items() if key in allowed_kwargs
+        }
+
+    @staticmethod
     async def process_base_filters(
-        self, event: UpdateUnion, filters: List[BaseFilter]
-    ) -> Optional[Dict[str, Any]] | Literal[False]:
+        event: Any,
+        filters: list[BaseFilter],
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Асинхронно применяет фильтры к событию.
 
         Args:
-            event (UpdateUnion): Событие.
-            filters (List[BaseFilter]): Список фильтров.
+            event: Событие.
+            filters: Список фильтров.
 
         Returns:
-            Optional[Dict[str, Any]] | Literal[False]: Словарь с результатом или False.
+            dict[str, Any] | None: Словарь с результатом или None,
+                если фильтр не прошёл.
         """
 
-        data = {}
+        available_data: dict[str, Any] = dict(data or {})
+        filter_data: dict[str, Any] = {}
 
         for _filter in filters:
-            result = await _filter(event)
+            kwargs = Dispatcher._resolve_filter_kwargs(_filter, available_data)
+            result = await _filter(event, **kwargs)
 
             if isinstance(result, dict):
-                data.update(result)
+                filter_data.update(result)
+                available_data.update(result)
 
             elif not result:
-                return result
+                return None
 
-        return data
+        return filter_data
 
-    async def _check_router_filters(
-        self, event: UpdateUnion, router: "Router | Dispatcher"
-    ) -> Optional[Dict[str, Any]] | Literal[False]:
+    def _iter_routers(
+        self,
+        routers: list[Router | Dispatcher],
+        parent_outer_middlewares: list[BaseMiddleware] | None = None,
+        parent_inner_middlewares: list[BaseMiddleware] | None = None,
+        parent_filters: list[MagicFilter] | None = None,
+        parent_base_filters: list[BaseFilter] | None = None,
+        path: set[int] | None = None,
+    ) -> Iterator[
+        tuple[
+            Router | Dispatcher,
+            list[BaseMiddleware],
+            list[BaseMiddleware],
+            list[MagicFilter],
+            list[BaseFilter],
+        ]
+    ]:
         """
-        Проверяет фильтры роутера для события.
+        Рекурсивно обходит роутеры, накапливая middleware и фильтры родителей.
 
         Args:
-            event (UpdateUnion): Событие.
-            router (Router | Dispatcher): Роутер для проверки.
+            routers: Список роутеров для обхода.
+            parent_outer_middlewares: Накопленные outer middleware от
+                родительских роутеров.
+            parent_inner_middlewares: Накопленные inner middleware от
+                родительских роутеров.
+            parent_filters: Накопленные MagicFilter от родительских
+                роутеров.
+            parent_base_filters: Накопленные BaseFilter от родительских
+                роутеров.
+            path: Идентификаторы роутеров в текущей ветви обхода; используется,
+                чтобы не уходить в бесконечную рекурсию при циклических
+                включениях между роутерами.
+
+        Yields:
+            Кортеж (роутер, outer_mw, inner_mw, MagicFilter, BaseFilter)
+            с накопленными значениями от всех родителей.
+        """
+        outer_middlewares = parent_outer_middlewares or []
+        inner_middlewares = parent_inner_middlewares or []
+        filters = parent_filters or []
+        base_filters = parent_base_filters or []
+
+        if path is None:
+            path = set()
+
+        for router in routers:
+            router_key = id(router)
+            if router_key in path:
+                continue
+
+            accumulated_outer_middlewares: list[BaseMiddleware]
+            if router is self:
+                accumulated_outer_middlewares = outer_middlewares
+                accumulated_inner_middlewares: list[BaseMiddleware] = (
+                    inner_middlewares
+                )
+            else:
+                accumulated_outer_middlewares = (
+                    outer_middlewares + router.outer_middlewares
+                )
+                accumulated_inner_middlewares = (
+                    inner_middlewares + router.inner_middlewares
+                )
+
+            accumulated_filters = filters + router.filters
+            accumulated_base_filters = base_filters + router.base_filters
+
+            yield (
+                router,
+                accumulated_outer_middlewares,
+                accumulated_inner_middlewares,
+                accumulated_filters,
+                accumulated_base_filters,
+            )
+
+            sub_routers = (
+                []
+                if router is self
+                else [r for r in router.routers if r is not self]
+            )
+            if sub_routers:
+                path.add(router_key)
+                try:
+                    yield from self._iter_routers(
+                        routers=sub_routers,
+                        parent_outer_middlewares=(
+                            accumulated_outer_middlewares
+                        ),
+                        parent_inner_middlewares=(
+                            accumulated_inner_middlewares
+                        ),
+                        parent_filters=accumulated_filters,
+                        parent_base_filters=accumulated_base_filters,
+                        path=path,
+                    )
+                finally:
+                    path.discard(router_key)
+
+    def _iter_unique_routers(
+        self,
+        routers: list[Router | Dispatcher],
+        parent_outer_middlewares: list[BaseMiddleware] | None = None,
+        parent_inner_middlewares: list[BaseMiddleware] | None = None,
+        parent_filters: list[MagicFilter] | None = None,
+        parent_base_filters: list[BaseFilter] | None = None,
+        *,
+        warn_duplicates: bool = False,
+    ) -> Iterator[
+        tuple[
+            Router | Dispatcher,
+            list[BaseMiddleware],
+            list[BaseMiddleware],
+            list[MagicFilter],
+            list[BaseFilter],
+        ]
+    ]:
+        """
+        Обходит дерево роутеров и исключает повторные экземпляры роутеров.
+
+        При повторном включении одного и того же объекта роутера используется
+        контекст первого вхождения (накопленные middleware и фильтры).
+
+        Args:
+            routers: Список роутеров для обхода.
+            parent_outer_middlewares: Накопленные outer middleware от
+                родительских роутеров.
+            parent_inner_middlewares: Накопленные inner middleware от
+                родительских роутеров.
+            parent_filters: Накопленные MagicFilter от родительских
+                роутеров.
+            parent_base_filters: Накопленные BaseFilter от родительских
+                роутеров.
+            warn_duplicates: Если True, выводит предупреждение при обнаружении
+                повторных включений одного и того же экземпляра роутера.
+        """
+        seen: set[int] = set()
+        duplicate_keys: set[int] = set()
+        duplicate_titles: list[str] = []
+        try:
+            for item in self._iter_routers(
+                routers=routers,
+                parent_outer_middlewares=parent_outer_middlewares,
+                parent_inner_middlewares=parent_inner_middlewares,
+                parent_filters=parent_filters,
+                parent_base_filters=parent_base_filters,
+            ):
+                router = item[0]
+                router_key = id(router)
+                if router_key in seen:
+                    if warn_duplicates and router_key not in duplicate_keys:
+                        duplicate_keys.add(router_key)
+                        rid = getattr(router, "router_id", None)
+                        router_title = (
+                            str(rid)
+                            if rid is not None
+                            else router.__class__.__name__
+                        )
+                        duplicate_titles.append(router_title)
+                    continue
+                seen.add(router_key)
+                yield item
+        finally:
+            if warn_duplicates and duplicate_titles:
+                logger_dp.warning(
+                    "Обнаружены повторные включения роутеров: %s. "
+                    "Повторные вхождения будут дедуплицированы.",
+                    ", ".join(duplicate_titles),
+                )
+
+    async def _check_router_filters(
+        self,
+        event: UpdateUnion,
+        filters: list[MagicFilter],
+        base_filters: list[BaseFilter],
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Проверяет накопленные фильтры роутера для события.
+
+        Args:
+            event: Событие.
+            filters: Накопленные MagicFilter.
+            base_filters: Накопленные BaseFilter.
 
         Returns:
-            Optional[Dict[str, Any]] | Literal[False]: Словарь с данными или False, если фильтры не прошли.
+            dict[str, Any] | None: Словарь с данными или None,
+                если фильтры не прошли.
         """
-        if router.filters:
-            if not filter_attrs(event, *router.filters):
-                return False
+        if filters and not filter_attrs(event, *filters):
+            return None
 
-        if router.base_filters:
-            result = await self.process_base_filters(
-                event=event, filters=router.base_filters
+        if base_filters:
+            return await self.process_base_filters(
+                event=event, filters=base_filters, data=data
             )
-            if isinstance(result, dict):
-                return result
-            if not result:
-                return False
 
         return {}
 
+    @staticmethod
     def _find_matching_handlers(
-        self, router: "Router | Dispatcher", event_type: UpdateType
-    ) -> List[Handler]:
+        router: Router | Dispatcher, event_type: UpdateType
+    ) -> list[Handler]:
         """
         Находит обработчики, соответствующие типу события в роутере.
 
         Args:
-            router (Router | Dispatcher): Роутер для поиска.
-            event_type (UpdateType): Тип события.
+            router: Роутер для поиска.
+            event_type: Тип события.
 
         Returns:
             List[Handler]: Список подходящих обработчиков.
         """
-        matching_handlers = []
-        for handler in router.event_handlers:
-            if handler.update_type == event_type:
-                matching_handlers.append(handler)
-        return matching_handlers
+        index = router.handlers_by_type
+        if index is not None:
+            return index.get(event_type, [])
+
+        return [
+            handler
+            for handler in router.event_handlers
+            if handler.update_type == event_type
+        ]
 
     async def _check_handler_match(
         self,
         handler: Handler,
         event: UpdateUnion,
-        current_state: Optional[Any],
-    ) -> Optional[Dict[str, Any]] | Literal[False]:
+        current_state: Any | None,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Проверяет, подходит ли обработчик для события (фильтры, состояние).
 
         Args:
-            handler (Handler): Обработчик для проверки.
-            event (UpdateUnion): Событие.
-            current_state (Optional[Any]): Текущее состояние.
+            handler: Обработчик для проверки.
+            event: Событие.
+            current_state: Текущее состояние.
 
         Returns:
-            Optional[Dict[str, Any]] | Literal[False]: Словарь с данными или False, если не подходит.
+            dict[str, Any] | None: Словарь с данными или None,
+                если не подходит.
         """
-        if handler.filters:
-            if not filter_attrs(event, *handler.filters):
-                return False
+        check_data = dict(data or {})
+        check_data.setdefault("raw_state", current_state)
 
-        if handler.states:
-            if current_state not in handler.states:
-                return False
+        handler_data: dict[str, Any] = {}
 
-        if handler.base_filters:
-            result = await self.process_base_filters(
-                event=event, filters=handler.base_filters
+        if handler.states and handler.state_filter is None:
+            handler.prepare_state_filter()
+
+        if handler.state_filter is not None:
+            state_result = await self.process_base_filters(
+                event=event,
+                filters=[handler.state_filter],
+                data=check_data,
             )
-            if isinstance(result, dict):
-                return result
-            if not result:
-                return False
+            if state_result is None:
+                return None
+            handler_data.update(state_result)
+            check_data.update(state_result)
 
-        return {}
+        filter_result = await self._check_router_filters(
+            event=event,
+            filters=handler.filters,
+            base_filters=handler.base_filters,
+            data=check_data,
+        )
+        if filter_result is None:
+            return None
+
+        handler_data.update(filter_result)
+        return handler_data
 
     async def _execute_handler(
         self,
         handler: Handler,
         event: UpdateUnion,
-        data: Dict[str, Any],
-        handler_middlewares: List[BaseMiddleware],
-        memory_context: MemoryContext,
-        current_state: Optional[Any],
+        data: dict[str, Any],
+        handler_middlewares: list[BaseMiddleware],
+        memory_context: BaseContext,
+        current_state: Any | None,
         router_id: Any,
         process_info: str,
+        router: Router | Dispatcher | None = None,
     ) -> None:
         """
-        Выполняет обработчик с построением цепочки middleware и обработкой ошибок.
+        Выполняет обработчик с построением цепочки middleware
+        и обработкой ошибок.
 
         Args:
-            handler (Handler): Обработчик для выполнения.
-            event (UpdateUnion): Событие.
-            data (Dict[str, Any]): Данные для обработчика.
-            handler_middlewares (List[BaseMiddleware]): Middleware для обработчика.
-            memory_context (MemoryContext): Контекст памяти.
-            current_state (Optional[Any]): Текущее состояние.
-            router_id (Any): Идентификатор роутера для логов.
-            process_info (str): Информация о процессе для логов.
+            handler: Обработчик для выполнения.
+            event: Событие.
+            data: Данные для обработчика.
+            handler_middlewares: Middleware для
+                обработчика.
+            memory_context: Контекст памяти.
+            current_state: Текущее состояние.
+            router_id: Идентификатор роутера для логов.
+            process_info: Информация о процессе для логов.
 
         Raises:
             HandlerException: При ошибке выполнения обработчика.
         """
-        func_args = handler.func_event.__annotations__.keys()
-        kwargs_filtered = {k: v for k, v in data.items() if k in func_args}
-
-        if "context" not in kwargs_filtered and "context" in data:
-            kwargs_filtered["context"] = data["context"]
-
-        handler_chain = self.build_middleware_chain(
+        handler_chain = handler.mw_chain or self.build_middleware_chain(
             handler_middlewares,
             functools.partial(self.call_handler, handler),
         )
 
         try:
-            await handler_chain(event, kwargs_filtered)
+            await handler_chain(event, data)
         except Exception as e:
             mem_data = await memory_context.get_data()
             raise HandlerException(
@@ -532,133 +995,479 @@ class Dispatcher(BotMixin):
                     "state": current_state,
                 },
                 cause=e,
+                router=router,
             ) from e
 
-    async def handle_raw_response(self, event_type: UpdateType, raw_data: Dict[str, Any]):
+    async def handle_raw_response(
+        self, event_type: UpdateType, raw_data: dict[str, Any]
+    ) -> None:
         """
         Специальный метод для обработки сырых ответов API.
         """
-        for index, router in enumerate(self.routers):
-            matching_handlers = self._find_matching_handlers(router, event_type)
+        entries = (
+            self._cached_router_entries
+            if self._cached_router_entries is not None
+            else self._iter_unique_routers(self.routers)
+        )
+        for router, *_ in entries:
+            matching_handlers = self._find_matching_handlers(
+                router=router,
+                event_type=event_type,
+            )
             for handler in matching_handlers:
                 try:
-                    await self.call_handler(handler, raw_data, {})
-                except Exception as e:
-                    logger_dp.exception(f"Ошибка в обработчике RAW_API_RESPONSE: {e}")
+                    await self.call_handler(
+                        handler=handler,
+                        event_object=raw_data,
+                        data={},
+                    )
+                except Exception as e:  # noqa: PERF203
+                    logger_dp.exception(
+                        "Ошибка в обработчике RAW_API_RESPONSE: %r", e
+                    )
 
-    async def handle(self, event_object: UpdateUnion):
+    async def _run_router_handlers(
+        self,
+        router: Router | Dispatcher,
+        event: UpdateUnion,
+        data: dict[str, Any],
+        matching_handlers: list[Handler],
+        memory_context: BaseContext,
+        current_state: Any | None,
+        router_id: Any,
+        process_info: str,
+    ) -> bool:
         """
-        Основной обработчик события. Применяет фильтры, middleware и вызывает нужный handler.
+        Перебирает обработчики роутера и выполняет первый подходящий.
+
+        Returns:
+            bool: True если обработчик был выполнен.
+        """
+        for handler in matching_handlers:
+            handler_match_result = await self._check_handler_match(
+                handler=handler,
+                event=event,
+                current_state=current_state,
+                data=data,
+            )
+            if handler_match_result is None:
+                continue
+            data.update(handler_match_result)
+            await self._execute_handler(
+                handler=handler,
+                event=event,
+                data=data,
+                handler_middlewares=handler.middlewares,
+                memory_context=memory_context,
+                current_state=current_state,
+                router_id=router_id,
+                process_info=process_info,
+                router=router,
+            )
+            logger_dp.info(
+                "Обработано: router_id: %s | %s", router_id, process_info
+            )
+            return True
+        return False
+
+    async def _invoke_router_handlers(
+        self,
+        event: UpdateUnion,
+        handler_data: dict[str, Any],
+        *,
+        router: Router | Dispatcher,
+        matching_handlers: list[Handler],
+        memory_context: BaseContext,
+        current_state: Any | None,
+        router_id: Any,
+        process_info: str,
+    ) -> None:
+        """
+        Endpoint middleware-цепочки роутера: вызывает подходящий обработчик.
 
         Args:
-            event_object (UpdateUnion): Событие.
+            event: Событие.
+            handler_data: Данные для обработчика.
+            matching_handlers: Обработчики роутера для данного типа события.
+            memory_context: Контекст памяти.
+            current_state: Текущее состояние.
+            router_id: Идентификатор роутера для логов.
+            process_info: Информация о процессе для логов.
         """
+        try:
+            if await self._run_router_handlers(
+                router=router,
+                event=event,
+                data=handler_data,
+                matching_handlers=matching_handlers,
+                memory_context=memory_context,
+                current_state=current_state,
+                router_id=router_id,
+                process_info=process_info,
+            ):
+                handler_data["_handled"] = True
+        except HandlerException:
+            # Хендлер был найден и запущен — фиксируем флаг до re-raise,
+            # чтобы router outer middleware, поглотившая исключение,
+            # не получила ложное «Проигнорировано» в handle().
+            # Симметрично тому, что делает _process_event для global outer mw.
+            handler_data["_handled"] = True
+            raise
 
+    async def _dispatch_to_router(
+        self,
+        router: Router | Dispatcher,
+        event_object: UpdateUnion,
+        data: dict[str, Any],
+        matching_handlers: list[Handler],
+        router_outer_middlewares: list[BaseMiddleware],
+        memory_context: BaseContext,
+        current_state: Any | None,
+        router_id: Any,
+        process_info: str,
+    ) -> bool:
+        """
+        Диспатчит событие через outer middleware одного роутера.
+
+        Inner middleware к моменту вызова уже выпечены в
+        ``handler.mw_chain`` (см. :meth:`_prepare_handlers`).
+
+        Returns:
+            bool: True если событие было обработано.
+        """
+        data["_handled"] = False
+
+        process_fn = functools.partial(
+            self._invoke_router_handlers,
+            router=router,
+            matching_handlers=matching_handlers,
+            memory_context=memory_context,
+            current_state=current_state,
+            router_id=router_id,
+            process_info=process_info,
+        )
+
+        if router_outer_middlewares:
+            chain = self.build_middleware_chain(
+                router_outer_middlewares, process_fn
+            )
+            await chain(event_object, data)
+        else:
+            await process_fn(event_object, data)
+
+        return data.pop("_handled", False)
+
+    async def _iter_and_dispatch_routers(
+        self,
+        event_object: UpdateUnion,
+        data: dict[str, Any],
+        memory_context: BaseContext,
+        current_state: Any | None,
+        process_info: str,
+    ) -> tuple[Any, bool]:
+        """
+        Перебирает все роутеры и диспетчеризует событие.
+
+        Returns:
+            tuple[Any, bool]: (router_id, is_handled)
+        """
+        router_id = None
+
+        entries: Iterable[
+            tuple[
+                Router | Dispatcher,
+                list[BaseMiddleware],
+                list[MagicFilter],
+                list[BaseFilter],
+            ]
+        ]
+        if self._ready:
+            if self._cached_router_entries is None:
+                self._cached_router_entries = self._build_dispatch_entries()
+            entries = self._cached_router_entries
+        else:
+            entries = self._iter_dispatch_entries()
+
+        for (
+            router,
+            router_outer_middlewares,
+            router_filters,
+            router_base_filters,
+        ) in entries:
+            router_id = router.router_id or id(router)
+
+            router_filter_result = await self._check_router_filters(
+                event=event_object,
+                filters=router_filters,
+                base_filters=router_base_filters,
+                data=data,
+            )
+            if router_filter_result is None:
+                continue
+            data.update(router_filter_result)
+
+            matching_handlers = self._find_matching_handlers(
+                router=router,
+                event_type=event_object.update_type,
+            )
+            if not matching_handlers:
+                continue
+
+            if await self._dispatch_to_router(
+                router=router,
+                event_object=event_object,
+                data=data,
+                matching_handlers=matching_handlers,
+                router_outer_middlewares=router_outer_middlewares,
+                memory_context=memory_context,
+                current_state=current_state,
+                router_id=router_id,
+                process_info=process_info,
+            ):
+                return router_id, True
+
+        return router_id, False
+
+    def _on_background_task_done(self, task: asyncio.Task) -> None:
+        """Callback завершения фоновой задачи (use_create_task=True).
+
+        Удаляет задачу из пула и логирует необработанное исключение, если оно
+        есть. Без явного вызова ``task.exception()`` Python при сборке мусора
+        выдаст предупреждение *"Task exception was never retrieved"*.
+        """
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger_dp.exception(
+                    "Необработанное исключение в фоновой задаче handle(): %r",
+                    exc,
+                )
+
+    @staticmethod
+    def _get_middleware_title(chain: Any) -> str:
+        """Определяет имя middleware для диагностики."""
+        if hasattr(chain, "func"):
+            return str(chain.func.__class__.__name__)
+        return str(getattr(chain, "__name__", chain.__class__.__name__))
+
+    async def _process_event(
+        self,
+        event_object: UpdateUnion,
+        data: dict[str, Any],
+    ) -> None:
+        """
+        Endpoint глобальной middleware-цепочки: диспатчит событие
+        по роутерам.
+
+        Args:
+            event_object: Событие.
+            data: Данные от middleware-цепочки,
+                содержащие ``_memory_context``, ``_current_state``
+                и ``_process_info``.
+        """
+        memory_context = data["_memory_context"]
+        data["context"] = memory_context
+        data["raw_state"] = data["_current_state"]
+
+        try:
+            router_id, is_handled = await self._iter_and_dispatch_routers(
+                event_object=event_object,
+                data=data,
+                memory_context=memory_context,
+                current_state=data["_current_state"],
+                process_info=data["_process_info"],
+            )
+        except HandlerException as e:
+            # Хендлер был найден и запущен — фиксируем флаги до re-raise,
+            # чтобы outer middleware, поглотившая исключение, не получила
+            # ложное "Проигнорировано" в handle().
+            data["_router_id"] = e.router_id
+            data["_is_handled"] = True
+            raise
+
+        data["_router_id"] = router_id
+        data["_is_handled"] = is_handled
+
+    @staticmethod
+    def _unwrap_dispatch_exception(
+        exception: BaseException,
+    ) -> BaseException:
+        """Возвращает исходную ошибку из диспетчерской обёртки."""
+        if isinstance(exception, (HandlerException, MiddlewareException)):
+            return exception.cause or exception
+        return exception
+
+    def _build_error_event(
+        self,
+        event_object: UpdateUnion,
+        exception: BaseException,
+        *,
+        memory_context: BaseContext,
+        current_state: Any | None,
+        router_id: Any,
+        process_info: str,
+    ) -> ErrorEventObject:
+        """Создаёт объект события ошибки."""
+        return ErrorEventObject(
+            update=event_object,
+            exception=self._unwrap_dispatch_exception(exception),
+            handler_exception=(
+                exception if isinstance(exception, HandlerException) else None
+            ),
+            middleware_exception=(
+                exception
+                if isinstance(exception, MiddlewareException)
+                else None
+            ),
+            context=memory_context,
+            raw_state=current_state,
+            router_id=router_id,
+            process_info=process_info,
+        )
+
+    async def _check_error_handler_match(
+        self,
+        handler: ErrorHandler,
+        event: ErrorEventObject,
+        data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Проверяет фильтры обработчика ошибки."""
+        if handler.filters and not filter_attrs(event, *handler.filters):
+            return None
+
+        if not handler.base_filters:
+            return {}
+
+        return await self.process_base_filters(
+            event=event, filters=handler.base_filters, data=data
+        )
+
+    async def _run_error_handlers(
+        self,
+        router: Router | Dispatcher,
+        event: ErrorEventObject,
+        data: dict[str, Any],
+    ) -> bool:
+        """Запускает первый подходящий обработчик ошибки роутера."""
+        for handler in router.error_handlers:
+            match_data = await self._check_error_handler_match(
+                handler=handler,
+                event=event,
+                data=data,
+            )
+            if match_data is None:
+                continue
+
+            data.update(match_data)
+            await self.call_error_handler(handler, event, data)
+            return True
+
+        return False
+
+    async def _process_error(
+        self,
+        event_object: UpdateUnion,
+        exception: BaseException,
+        *,
+        memory_context: BaseContext,
+        current_state: Any | None,
+        router_id: Any,
+        process_info: str,
+    ) -> bool:
+        """
+        Диспатчит ошибку в ``errors``-обработчики.
+
+        Returns:
+            True, если ошибка обработана пользовательским handler.
+        """
+        error_event = self._build_error_event(
+            event_object=event_object,
+            exception=exception,
+            memory_context=memory_context,
+            current_state=current_state,
+            router_id=router_id,
+            process_info=process_info,
+        )
+        data: dict[str, Any] = {
+            "context": memory_context,
+            "raw_state": current_state,
+            "router_id": router_id,
+            "process_info": process_info,
+            "exception": error_event.exception,
+            "handler_exception": error_event.handler_exception,
+            "middleware_exception": error_event.middleware_exception,
+            "update": event_object,
+        }
+
+        try:
+            router = (
+                exception.router
+                if isinstance(exception, HandlerException)
+                else None
+            )
+            if (
+                router is not None
+                and router is not self
+                and await self._run_error_handlers(router, error_event, data)
+            ):
+                return True
+
+            return await self._run_error_handlers(self, error_event, data)
+        except Exception as error_handler_exception:
+            logger_dp.exception(
+                "Ошибка в обработчике ошибки: %r | исходная ошибка: %r",
+                error_handler_exception,
+                exception,
+            )
+            return False
+
+    async def handle(self, event_object: UpdateUnion) -> None:
+        """
+        Основной обработчик события. Применяет фильтры, middleware
+        и вызывает нужный handler.
+
+        Args:
+            event_object: Событие.
+        """
         router_id = None
         process_info = "нет данных"
 
         try:
             ids = event_object.get_ids()
-            memory_context = self.__get_memory_context(*ids)
+            memory_context = self.__get_context(*ids)
             current_state = await memory_context.get_state()
-            kwargs = {"context": memory_context}
 
-            process_info = f"{event_object.update_type} | chat_id: {ids[0]}, user_id: {ids[1]}"
+            process_info = (
+                f"{event_object.update_type} | "
+                f"chat_id: {ids[0]}, user_id: {ids[1]}"
+            )
 
-            is_handled = False
+            kwargs: dict[str, Any] = {
+                "context": memory_context,
+                "raw_state": current_state,
+                "_memory_context": memory_context,
+                "_current_state": current_state,
+                "_process_info": process_info,
+            }
 
-            async def _process_event(
-                _: UpdateUnion, data: Dict[str, Any]
-            ) -> None:
-                nonlocal router_id, is_handled, memory_context, current_state
-
-                data["context"] = memory_context
-
-                for index, router in enumerate(self.routers):
-                    if is_handled:
-                        break
-
-                    router_id = router.router_id or index
-
-                    router_filter_result = await self._check_router_filters(
-                        event_object, router
-                    )
-
-                    if router_filter_result is False:
-                        continue
-
-                    if isinstance(router_filter_result, dict):
-                        data.update(router_filter_result)
-
-                    matching_handlers = self._find_matching_handlers(
-                        router, event_object.update_type
-                    )
-
-                    async def _process_handlers(
-                        event: UpdateUnion, handler_data: Dict[str, Any]
-                    ) -> None:
-                        nonlocal is_handled
-
-                        for handler in matching_handlers:
-                            handler_match_result = (
-                                await self._check_handler_match(
-                                    handler, event, current_state
-                                )
-                            )
-
-                            if handler_match_result is False:
-                                continue
-
-                            if isinstance(handler_match_result, dict):
-                                handler_data.update(handler_match_result)
-
-                            await self._execute_handler(
-                                handler=handler,
-                                event=event,
-                                data=handler_data,
-                                handler_middlewares=handler.middlewares,
-                                memory_context=memory_context,
-                                current_state=current_state,
-                                router_id=router_id,
-                                process_info=process_info,
-                            )
-
-                            logger_dp.info(
-                                f"Обработано: router_id: {router_id} | {process_info}"
-                            )
-
-                            is_handled = True
-                            break
-
-                    if isinstance(router, Router) and router.middlewares:
-                        router_chain = self.build_middleware_chain(
-                            router.middlewares, _process_handlers
-                        )
-                        await router_chain(event_object, data)
-                    else:
-                        await _process_handlers(event_object, data)
-
-            global_chain = self.build_middleware_chain(
-                self.middlewares, _process_event
+            global_chain = (
+                self._global_mw_chain
+                or self.build_middleware_chain(
+                    self.outer_middlewares, self._process_event
+                )
             )
 
             try:
                 await global_chain(event_object, kwargs)
+            except HandlerException:
+                raise
             except Exception as e:
                 mem_data = await memory_context.get_data()
 
-                if hasattr(global_chain, "func"):
-                    middleware_title = global_chain.func.__class__.__name__  # type: ignore[attr-defined]
-                else:
-                    middleware_title = getattr(
-                        global_chain,
-                        "__name__",
-                        global_chain.__class__.__name__,
-                    )
-
                 raise MiddlewareException(
-                    middleware_title=middleware_title,
-                    router_id=router_id,
+                    middleware_title=self._get_middleware_title(global_chain),
+                    router_id=kwargs.get("_router_id", router_id),
                     process_info=process_info,
                     memory_context={
                         "data": mem_data,
@@ -667,194 +1476,261 @@ class Dispatcher(BotMixin):
                     cause=e,
                 ) from e
 
+            router_id = kwargs.get("_router_id")
+            is_handled = kwargs.get("_is_handled", False)
+
             if not is_handled:
                 logger_dp.info(
-                    f"Проигнорировано: router_id: {router_id} | {process_info}"
+                    "Проигнорировано: router_id: %s | %s",
+                    router_id,
+                    process_info,
                 )
-        except Exception as e:
-            logger_dp.warning(
-                f"Ошибка при обработке события: router_id: {router_id} | {process_info}",
-                exc_info=False,
-            )
-            raise e
 
-    async def start_polling(self, bot: Bot, skip_updates: bool = False):
+        except HandlerException as e:
+            if await self._process_error(
+                event_object=event_object,
+                exception=e,
+                memory_context=memory_context,
+                current_state=current_state,
+                router_id=e.router_id,
+                process_info=process_info,
+            ):
+                return
+            logger_dp.exception(
+                "Ошибка в обработчике: %s",
+                e,
+                exc_info=e.cause,
+            )
+        except MiddlewareException as e:
+            if await self._process_error(
+                event_object=event_object,
+                exception=e,
+                memory_context=memory_context,
+                current_state=current_state,
+                router_id=e.router_id,
+                process_info=process_info,
+            ):
+                return
+            logger_dp.exception(
+                "Ошибка при обработке события: router_id: %s | %s | %r",
+                e.router_id,
+                process_info,
+                e,
+            )
+        except Exception as e:
+            logger_dp.exception(
+                "Ошибка при обработке события: router_id: %s | %s | %r",
+                router_id,
+                process_info,
+                e,
+            )
+
+    async def _fetch_updates_once(self, bot: Bot) -> dict | None:
+        """
+        Делает один запрос get_updates.
+
+        Returns:
+            dict | None: словарь событий или None при recoverable-ошибке.
+
+        Raises:
+            InvalidToken: при неверном токене бота.
+        """
+        try:
+            return await bot.get_updates(marker=bot.marker_updates)
+        except AsyncioTimeoutError:
+            return None
+        except (MaxConnection, ClientConnectorError) as e:
+            logger_dp.warning(
+                "Ошибка подключения при получении обновлений: %r, "
+                "жду %s секунд",
+                e,
+                CONNECTION_RETRY_DELAY,
+            )
+            await asyncio.sleep(CONNECTION_RETRY_DELAY)
+            return None
+        except InvalidToken:
+            logger_dp.error("Неверный токен! Останавливаю polling")
+            self.polling = False
+            raise
+        except MaxApiError as e:
+            logger_dp.info(
+                "Ошибка при получении обновлений: %r, жду %s секунд",
+                e,
+                GET_UPDATES_RETRY_DELAY,
+            )
+            await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
+            return None
+        except Exception as e:
+            logger_dp.error(
+                "Неожиданная ошибка при получении обновлений: %r",
+                e,
+            )
+            await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
+            return None
+
+    async def _dispatch_fetched_events(
+        self,
+        events: dict,
+        current_timestamp: int,
+        *,
+        skip_updates: bool,
+    ) -> None:
+        """Обрабатывает полученные от API события."""
+        try:
+            bot = self._ensure_bot()
+            bot.marker_updates = events.get("marker")
+
+            processed_events = await process_update_request(
+                events=events, bot=bot
+            )
+
+            for event in processed_events:
+                if skip_updates and event.timestamp < current_timestamp:
+                    logger_dp.info(
+                        "Пропуск события от %s: %s",
+                        from_ms(event.timestamp),
+                        event.update_type,
+                    )
+                    continue
+
+                if self.use_create_task:
+                    task = asyncio.create_task(self.handle(event))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._on_background_task_done)
+                else:
+                    await self.handle(event)
+
+        except ClientConnectorError:
+            logger_dp.error(
+                "Ошибка подключения, жду %s секунд", CONNECTION_RETRY_DELAY
+            )
+            await asyncio.sleep(CONNECTION_RETRY_DELAY)
+        except Exception as e:
+            logger_dp.error(
+                "Общая ошибка при обработке событий: %r",
+                e,
+            )
+
+    async def start_polling(
+        self, bot: Bot, *, skip_updates: bool = False
+    ) -> None:
         """
         Запускает цикл получения обновлений (long polling).
 
         Args:
-            bot (Bot): Экземпляр бота.
-            skip_updates (bool): Флаг, отвечающий за обработку старых событий.
+            bot: Экземпляр бота.
+            skip_updates: Флаг, отвечающий за обработку старых событий.
         """
-
         self.polling = True
 
         await self.__ready(bot)
 
-        current_timestamp = int(datetime.now().timestamp() * 1000)
+        current_timestamp = to_ms(datetime.now())
 
         while self.polling:
-            try:
-                events: Dict = await self._ensure_bot().get_updates(
-                    marker=self._ensure_bot().marker_updates
-                )
-            except AsyncioTimeoutError:
+            events = await self._fetch_updates_once(bot)
+            if events is None:
                 continue
-            except (MaxConnection, ClientConnectorError) as e:
-                logger_dp.warning(
-                    f"Ошибка подключения при получении обновлений: {e}, жду {CONNECTION_RETRY_DELAY} секунд"
-                )
-                await asyncio.sleep(CONNECTION_RETRY_DELAY)
-                continue
-            except InvalidToken:
-                logger_dp.error("Неверный токен! Останавливаю polling")
-                self.polling = False
-                raise
-            except MaxApiError as e:
-                logger_dp.info(
-                    f"Ошибка при получении обновлений: {e}, жду {GET_UPDATES_RETRY_DELAY} секунд"
-                )
-                await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
-                continue
-            except Exception as e:
-                logger_dp.error(
-                    f"Неожиданная ошибка при получении обновлений: {e.__class__.__name__}: {e}"
-                )
-                await asyncio.sleep(GET_UPDATES_RETRY_DELAY)
-                continue
+            await self._dispatch_fetched_events(
+                events, current_timestamp, skip_updates=skip_updates
+            )
 
-            try:
-                self._ensure_bot().marker_updates = events.get("marker")
-
-                processed_events = await process_update_request(
-                    events=events, bot=self._ensure_bot()
-                )
-
-                for event in processed_events:
-                    if skip_updates:
-                        if event.timestamp < current_timestamp:
-                            logger_dp.info(
-                                f"Пропуск события от {datetime.fromtimestamp(event.timestamp / 1000)}: {event.update_type}"
-                            )
-                            continue
-
-                    if self.use_create_task:
-                        asyncio.create_task(self.handle(event))
-
-                    else:
-                        await self.handle(event)
-
-            except ClientConnectorError:
-                logger_dp.error(
-                    f"Ошибка подключения, жду {CONNECTION_RETRY_DELAY} секунд"
-                )
-                await asyncio.sleep(CONNECTION_RETRY_DELAY)
-            except Exception as e:
-                logger_dp.error(
-                    f"Общая ошибка при обработке событий: {e.__class__} - {e}"
-                )
-
-    async def stop_polling(self):
+    async def stop_polling(self) -> None:
         """
         Останавливает цикл получения обновлений (long polling).
 
-        Этот метод устанавливает флаг polling в False, что приводит к
-        завершению цикла в методе start_polling.
+        Дожидается завершения всех фоновых задач (use_create_task=True),
+        запущенных до момента остановки.
         """
         if self.polling:
             self.polling = False
+            self._ready = False
             logger_dp.info("Polling остановлен")
+
+        if self._background_tasks:
+            logger_dp.info(
+                "Ожидаю завершения %d фоновых задач...",
+                len(self._background_tasks),
+            )
+            await asyncio.gather(
+                *self._background_tasks, return_exceptions=True
+            )
+            logger_dp.info("Все фоновые задачи завершены")
+
+    async def startup(self, bot: Bot) -> None:
+        """
+        Инициализирует диспетчер: сохраняет бота, подготавливает
+        обработчики и вызывает on_started.
+
+        Используется интеграционными модулями (например,
+        maxapi.webhook.fastapi) для инициализации в lifespan
+        веб-фреймворка.
+
+        Args:
+            bot: Экземпляр бота.
+        """
+        await self.__ready(bot)
 
     async def handle_webhook(
         self,
         bot: Bot,
+        *,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
-        **kwargs,
-    ):
+        path: str = DEFAULT_PATH,
+        secret: str | None = None,
+        webhook_type: type[BaseMaxWebhook] = AiohttpMaxWebhook,
+        **kwargs: Any,
+    ) -> None:
         """
-        Запускает FastAPI-приложение для приёма обновлений через вебхук.
+        Запускает вебхук-сервер (aiohttp) для приёма обновлений.
+
+        Удобный метод «всё в одном»: создаёт aiohttp-приложение через
+        :class:`~maxapi.webhook.aiohttp.BaseMaxWebhook`,
+        регистрирует маршрут и запускает сервер.
+
+        Для более гибкого управления жизненным циклом сервера используйте
+        одну из реализаций BaseMaxWebhook напрямую, например
+        :class:`~maxapi.webhook.aiohttp.BaseMaxWebhook`.
 
         Args:
-            bot (Bot): Экземпляр бота.
-            host (str): Хост сервера.
-            port (int): Порт сервера.
+            bot: Экземпляр бота.
+            host: Хост сервера (по умолчанию ``"0.0.0.0"``).
+            port: Порт сервера (по умолчанию ``8080``).
+            path: URL-путь для маршрута вебхука.
+            secret: Секрет для проверки заголовка
+                ``X-Max-Bot-Api-Secret``. Должен совпадать со значением,
+                переданным в :meth:`~maxapi.Bot.subscribe_webhook`.
+            webhook_type: Класс вебхука.
+            **kwargs: Дополнительные аргументы для ``aiohttp.web.AppRunner``.
         """
+        webhook = webhook_type(dp=self, bot=bot, secret=secret)
+        await webhook.run(host=host, port=port, path=path, **kwargs)
 
-        if not FASTAPI_INSTALLED:
-            raise ImportError(
-                "\n\t Не установлен fastapi!"
-                "\n\t Выполните команду для установки fastapi: "
-                "\n\t pip install fastapi>=0.68.0"
-                "\n\t Или сразу все зависимости для работы вебхука:"
-                "\n\t pip install maxapi[webhook]"
-            )
-
-        elif not UVICORN_INSTALLED:
-            raise ImportError(
-                "\n\t Не установлен uvicorn!"
-                "\n\t Выполните команду для установки uvicorn: "
-                "\n\t pip install uvicorn>=0.15.0"
-                "\n\t Или сразу все зависимости для работы вебхука:"
-                "\n\t pip install maxapi[webhook]"
-            )
-
-        @self.webhook_post("/")
-        async def _(request: Request):
-            event_json = await request.json()
-            event_object = await process_update_webhook(
-                event_json=event_json, bot=bot
-            )
-
-            if self.use_create_task:
-                asyncio.create_task(self.handle(event_object))
-            else:
-                await self.handle(event_object)
-
-            return JSONResponse(  # pyright: ignore[reportPossiblyUnboundVariable]
-                content={"ok": True}, status_code=200
-            )
-
-        await self.init_serve(bot=bot, host=host, port=port, **kwargs)
-
-    async def init_serve(
+    async def init_serve(  # pragma: no cover
         self,
         bot: Bot,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """
-        Запускает сервер для обработки вебхуков.
+        .. deprecated::
+            Используйте :meth:`handle_webhook` вместо ``init_serve``.
+            Метод будет удалён в одной из следующих версий.
 
         Args:
-            bot (Bot): Экземпляр бота.
-            host (str): Хост.
-            port (int): Порт.
+            bot: Экземпляр бота.
+            host: Хост.
+            port: Порт.
         """
-
-        if not UVICORN_INSTALLED:
-            raise ImportError(
-                "\n\t Не установлен uvicorn!"
-                "\n\t Выполните команду для установки uvicorn: "
-                "\n\t pip install uvicorn>=0.15.0"
-                "\n\t Или сразу все зависимости для работы вебхука:"
-                "\n\t pip install maxapi[webhook]"
-            )
-
-        if self.webhook_app is None:
-            raise RuntimeError("webhook_app не инициализирован")
-
-        config = Config(  # pyright: ignore[reportPossiblyUnboundVariable]
-            app=self.webhook_app, host=host, port=port, **kwargs
+        warn(
+            "init_serve устарел и будет удалён в следующих версиях. "
+            "Используйте handle_webhook вместо него.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-        server = Server(  # pyright: ignore[reportPossiblyUnboundVariable]
-            config
-        )
-
-        await self.__ready(bot)
-
-        await server.serve()
+        await self.handle_webhook(bot, host=host, port=port, **kwargs)
 
 
 class Router(Dispatcher):
@@ -867,10 +1743,64 @@ class Router(Dispatcher):
         Инициализация роутера.
 
         Args:
-            router_id (str | None): Идентификатор роутера для логов.
+            router_id: Идентификатор роутера для логов.
         """
 
         super().__init__(router_id)
+
+    @property
+    def fsm(self) -> ContextManager:
+        """
+        Роутер не владеет FSM-хранилищем.
+        """
+        msg = "Router не владеет FSM-хранилищем. Используйте dp.fsm."
+        raise RuntimeError(msg)
+
+
+class ErrorEventObserver:
+    """
+    Декоратор для регистрации обработчиков ошибок.
+    """
+
+    def __init__(self, router: Dispatcher | Router) -> None:
+        """
+        Инициализирует декоратор ошибок.
+
+        Args:
+            router: Экземпляр роутера или диспетчера.
+        """
+        self.router = router
+
+    def register(
+        self, func_event: Callable, *args: Any, **_kwargs: Any
+    ) -> Callable:
+        """
+        Регистрирует функцию как обработчик ошибки.
+
+        Args:
+            func_event: Функция-обработчик ошибки.
+            *args: Типы исключений или фильтры.
+
+        Returns:
+            Callable: Исходная функция.
+        """
+        self.router.error_handlers.append(
+            ErrorHandler(*args, func_event=func_event)
+        )
+        return func_event
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Callable:
+        """
+        Регистрирует функцию как обработчик ошибки через декоратор.
+
+        Returns:
+            Callable: Декоратор.
+        """
+
+        def decorator(func_event: Callable) -> Callable:
+            return self.register(func_event, *args, **kwargs)
+
+        return decorator
 
 
 class Event:
@@ -882,15 +1812,16 @@ class Event:
         self,
         update_type: UpdateType,
         router: Dispatcher | Router,
+        *,
         deprecated: bool = False,
     ):
         """
         Инициализирует событие-декоратор.
 
         Args:
-            update_type (UpdateType): Тип события.
-            router (Dispatcher | Router): Экземпляр роутера или диспетчера.
-            deprecated (bool): Флаг, указывающий на то, что событие устарело.
+            update_type: Тип события.
+            router: Экземпляр роутера или диспетчера.
+            deprecated: Флаг, указывающий на то, что событие устарело.
         """
 
         self.update_type = update_type
@@ -904,7 +1835,7 @@ class Event:
         Регистрирует функцию как обработчик события.
 
         Args:
-            func_event (Callable): Функция-обработчик
+            func_event: Функция-обработчик
             *args: Фильтры
             **kwargs: Дополнительные параметры (например, states)
 
@@ -913,10 +1844,9 @@ class Event:
         """
 
         if self.deprecated:
-            import warnings
-
             warnings.warn(
-                f"Событие {self.update_type} устарело и будет удалено в будущих версиях.",
+                f"Событие {self.update_type} устарело "
+                f"и будет удалено в будущих версиях.",
                 DeprecationWarning,
                 stacklevel=3,
             )
@@ -927,9 +1857,9 @@ class Event:
         else:
             self.router.event_handlers.append(
                 Handler(
+                    *args,
                     func_event=func_event,
                     update_type=self.update_type,
-                    *args,
                     **kwargs,
                 )
             )
@@ -943,7 +1873,7 @@ class Event:
             Callable: Декоратор.
         """
 
-        def decorator(func_event: Callable):
+        def decorator(func_event: Callable) -> Callable:
             return self.register(func_event, *args, **kwargs)
 
         return decorator

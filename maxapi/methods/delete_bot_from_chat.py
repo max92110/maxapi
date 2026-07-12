@@ -16,8 +16,8 @@ class DeleteMeFromMessage(BaseConnection):
     https://dev.max.ru/docs-api/methods/DELETE/chats/-chatId-/members/me
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        chat_id (int): Идентификатор чата, из которого нужно удалить бота.
+        bot: Экземпляр бота для выполнения запроса.
+        chat_id: Идентификатор чата, из которого нужно удалить бота.
     """
 
     def __init__(
@@ -25,6 +25,7 @@ class DeleteMeFromMessage(BaseConnection):
         bot: "Bot",
         chat_id: int,
     ):
+        super().__init__()
         self.bot = bot
         self.chat_id = chat_id
 

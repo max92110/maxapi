@@ -1,6 +1,9 @@
 """Тесты для типов и моделей."""
 
 # Core Stuff
+from datetime import datetime
+from typing import Any, ClassVar
+
 from maxapi.enums.attachment import AttachmentType
 from maxapi.enums.message_link_type import MessageLinkType
 from maxapi.enums.upload_type import UploadType
@@ -8,12 +11,40 @@ from maxapi.types import (
     BotCommand,
     CallbackButton,
     ChatButton,
+    ClipboardButton,
     LinkButton,
     RequestContactButton,
     RequestGeoLocationButton,
 )
 from maxapi.types.input_media import InputMediaBuffer
 from maxapi.types.message import NewMessageLink
+
+
+class TestUserFullName:
+    """Тесты для User.full_name."""
+
+    def _make_user(self, *, last_name: str | None):
+        from maxapi.types.users import User
+
+        return User(
+            user_id=1,
+            first_name="Alice",
+            last_name=last_name,
+            is_bot=False,
+            last_activity_time=0,
+        )
+
+    def test_full_name_with_none_last_name_returns_first_name(self):
+        user = self._make_user(last_name=None)
+        assert user.full_name == "Alice"
+
+    def test_full_name_with_empty_last_name_returns_first_name(self):
+        user = self._make_user(last_name="")
+        assert user.full_name == "Alice"
+
+    def test_full_name_with_last_name_returns_joined_name(self):
+        user = self._make_user(last_name="Cooper")
+        assert user.full_name == "Alice Cooper"
 
 
 class TestButtons:
@@ -32,6 +63,13 @@ class TestButtons:
         assert button.text == "Link"
         assert button.url == "https://example.com"
         assert button.type == "link"
+
+    def test_clipboard_button(self):
+        """Тест ClipboardButton."""
+        button = ClipboardButton(text="Copy", payload="secret")
+        assert button.text == "Copy"
+        assert button.payload == "secret"
+        assert button.type == "clipboard"
 
     def test_chat_button(self):
         """Тест ChatButton."""
@@ -91,7 +129,6 @@ class TestInputMedia:
         """Тест инициализации InputMedia."""
         # InputMedia требует путь к файлу, поэтому используем мок
         # В реальности нужно будет создать временный файл для теста
-        pass
 
     def test_input_media_buffer_init(self):
         """Тест инициализации InputMediaBuffer."""
@@ -126,3 +163,129 @@ class TestEnums:
         assert UploadType.VIDEO
         assert UploadType.AUDIO
         assert UploadType.FILE
+
+
+class TestDialogMuted:
+    """Тесты для DialogMuted."""
+
+    _USER: ClassVar[dict[str, Any]] = {
+        "user_id": 1,
+        "first_name": "Bot",
+        "is_bot": True,
+        "last_activity_time": 0,
+    }
+
+    def _make_event(self, muted_until: int):
+        from maxapi.types.updates.dialog_muted import DialogMuted
+
+        return DialogMuted(
+            timestamp=0,
+            chat_id=100,
+            muted_until=muted_until,
+            user=self._USER,
+        )
+
+    def test_muted_until_datetime_forever(self):
+        """При муте навсегда (INT64_MAX) возвращает datetime.max."""
+        INT64_MAX = 9223372036854775807
+        event = self._make_event(INT64_MAX)
+        result = event.muted_until_datetime
+        assert result == datetime.max
+
+    def test_muted_until_datetime_normal(self):
+        """При обычном значении возвращает корректный datetime."""
+        # 1 января 2030 года в миллисекундах
+        ts_ms = 1893456000000
+        event = self._make_event(ts_ms)
+        result = event.muted_until_datetime
+        assert result is not None
+        assert isinstance(result, datetime)
+        assert result == datetime.fromtimestamp(ts_ms / 1000)
+
+
+class TestUserAddedGetIds:
+    """Тесты для UserAdded.get_ids()."""
+
+    _USER: ClassVar[dict[str, Any]] = {
+        "user_id": 42,
+        "first_name": "Alice",
+        "is_bot": False,
+        "last_activity_time": 0,
+    }
+
+    def test_get_ids_returns_chat_and_user_id(self):
+        """get_ids() возвращает (chat_id, user.user_id)."""
+        from maxapi.enums.update import UpdateType
+        from maxapi.types.updates.user_added import UserAdded
+
+        event = UserAdded(
+            update_type=UpdateType.USER_ADDED,
+            timestamp=0,
+            chat_id=100,
+            user=self._USER,
+            is_channel=False,
+        )
+        chat_id, user_id = event.get_ids()
+        assert chat_id == 100
+        assert user_id == 42
+
+    def test_get_ids_ignores_inviter_id(self):
+        """get_ids() возвращает user.user_id, а не inviter_id."""
+        from maxapi.enums.update import UpdateType
+        from maxapi.types.updates.user_added import UserAdded
+
+        event = UserAdded(
+            update_type=UpdateType.USER_ADDED,
+            timestamp=0,
+            chat_id=100,
+            inviter_id=999,
+            user=self._USER,
+            is_channel=False,
+        )
+        _chat_id, user_id = event.get_ids()
+        assert user_id == 42
+        assert user_id != 999
+
+
+class TestUserRemovedGetIds:
+    """Тесты для UserRemoved.get_ids()."""
+
+    _USER: ClassVar[dict[str, Any]] = {
+        "user_id": 99,
+        "first_name": "Bob",
+        "is_bot": False,
+        "last_activity_time": 0,
+    }
+
+    def test_get_ids_returns_chat_and_user_id(self):
+        """get_ids() возвращает (chat_id, user.user_id)."""
+        from maxapi.enums.update import UpdateType
+        from maxapi.types.updates.user_removed import UserRemoved
+
+        event = UserRemoved(
+            update_type=UpdateType.USER_REMOVED,
+            timestamp=0,
+            chat_id=200,
+            user=self._USER,
+            is_channel=False,
+        )
+        chat_id, user_id = event.get_ids()
+        assert chat_id == 200
+        assert user_id == 99
+
+    def test_get_ids_ignores_admin_id(self):
+        """get_ids() возвращает user.user_id, а не admin_id."""
+        from maxapi.enums.update import UpdateType
+        from maxapi.types.updates.user_removed import UserRemoved
+
+        event = UserRemoved(
+            update_type=UpdateType.USER_REMOVED,
+            timestamp=0,
+            chat_id=200,
+            admin_id=888,
+            user=self._USER,
+            is_channel=False,
+        )
+        _chat_id, user_id = event.get_ids()
+        assert user_id == 99
+        assert user_id != 888

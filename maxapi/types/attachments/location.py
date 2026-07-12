@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 
 from ...enums.attachment import AttachmentType
 from .attachment import Attachment
@@ -9,10 +9,10 @@ class Location(Attachment):
     Вложение с типом геолокации.
 
     Attributes:
-        latitude (Optional[float]): Широта.
-        longitude (Optional[float]): Долгота.
+        latitude: Широта.
+        longitude: Долгота.
     """
 
     type: Literal[AttachmentType.LOCATION]  # pyright: ignore[reportIncompatibleVariableOverride]
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: float | None = None
+    longitude: float | None = None

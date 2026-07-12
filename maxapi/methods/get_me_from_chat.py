@@ -16,11 +16,12 @@ class GetMeFromChat(BaseConnection):
     https://dev.max.ru/docs-api/methods/GET/chats/-chatId-/members/me
 
     Attributes:
-        bot (Bot): Экземпляр бота.
-        chat_id (int): Идентификатор чата.
+        bot: Экземпляр бота.
+        chat_id: Идентификатор чата.
     """
 
     def __init__(self, bot: "Bot", chat_id: int):
+        super().__init__()
         self.bot = bot
         self.chat_id = chat_id
 

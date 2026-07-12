@@ -38,27 +38,69 @@ async def age_handler(event: MessageCreated, context: MemoryContext):
 - `set_state(state)` — установить состояние (State или None для сброса)
 - `get_state()` — получить текущее состояние
 - `get_data()` — получить все данные контекста
-- `update_data(**kwargs)` — обновить данные
+- `update_data(**kwargs)` — обновить данные и вернуть актуальный словарь
 - `set_data(data)` — полностью заменить данные
 - `clear()` — очистить контекст и сбросить состояние
 
-## Redis-хранилище
-
-Для сохранения контекста между перезапусками можно использовать Redis.
-
-1. Установите зависимость: `pip install maxapi[redis]`
-2. Передайте Redis-клиент при создании диспетчера:
+## Получение контекста вне хендлера
 
 ```python
-import redis.asyncio as redis
-from maxapi import Dispatcher
+context = dp.fsm.get_context(
+    chat_id=chat_id,
+    user_id=user_id,
+)
+```
 
-redis_client = redis.from_url("redis://localhost:6379")
+Для простых операций можно не получать объект контекста вручную:
+
+```python
+await dp.fsm.set_state(
+    chat_id=chat_id,
+    user_id=user_id,
+    state=Form.name,
+)
+await dp.fsm.update_data(
+    chat_id=chat_id,
+    user_id=user_id,
+    name="Макс",
+)
+await dp.fsm.update_data(
+    chat_id=chat_id,
+    user_id=user_id,
+    data={"chat_id": "значение в данных"},
+)
+data = await dp.fsm.get_data(chat_id=chat_id, user_id=user_id)
+await dp.fsm.clear(chat_id=chat_id, user_id=user_id)
+```
+
+Метод использует то же хранилище, TTL и LRU-кеш, что и обычная
+обработка событий. FSM manager доступен через `Dispatcher`: используйте
+`dp.fsm`, а не `router.fsm`.
+
+## TTL для контекста
+
+Для автоматической очистки неактивных контекстов можно передать `ttl`
+в секундах. TTL продлевается при каждом чтении или изменении контекста.
+Если время истекло, `state` и `data` будут лениво сброшены при следующем
+обращении.
+
+```python
+from maxapi import Dispatcher
+from maxapi.context import MemoryContext
+
+dp = Dispatcher(storage=MemoryContext, ttl=1800)
+```
+
+Тот же параметр можно использовать и для `RedisContext`:
+
+```python
+from maxapi.context import RedisContext
 
 dp = Dispatcher(
+    storage=RedisContext,
     redis_client=redis_client,
-    redis_prefix="maxapi:context",
-    redis_ttl=3600,  # опционально: время жизни ключей в секундах
+    key_prefix="my_bot",
+    ttl=1800,
 )
 ```
 
@@ -92,3 +134,105 @@ async def no_state_handler(event: MessageCreated):
 async def multi_state_handler(event: MessageCreated):
     ...
 ```
+
+## Хранение в Redis
+
+Для сохранения состояний и данных между перезапусками бота можно использовать Redis.
+
+### Установка зависимостей
+
+```bash
+pip install redis
+```
+
+### Пример использования
+
+```python
+import redis.asyncio as redis
+from maxapi import Dispatcher
+from maxapi.context import RedisContext
+
+# Инициализация клиента Redis
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+# Передача RedisContext в Диспетчер
+dp = Dispatcher(
+    storage=RedisContext,
+    redis_client=redis_client,
+    key_prefix="my_bot"
+)
+```
+
+`RedisContext` автоматически сериализует данные в JSON и поддерживает атомарные обновления через Lua-скрипты.
+
+### Маркер обновлений (`get_updates`)
+
+В MAX API у `get_updates` есть **маркер обновлений** — это внутренняя “позиция” в ленте событий (по сути, пагинация). Если запускать бота **без маркера**, API может начать отдавать **старые обновления** (с “начального” маркера), и бот будет повторно обрабатывать прошлые события.
+
+Решение простое: **сохраняйте маркер** и **передавайте его в бота при старте**.
+
+Ниже пример хранения маркера в Redis (асинхронный клиент), ровно как ключ `bot:marker`:
+
+```python
+import redis.asyncio as redis
+
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+
+async def load_marker() -> str | None:
+    return await r.get("bot:marker")
+
+
+async def save_marker(marker: str) -> None:
+    await r.set("bot:marker", marker)
+```
+
+Пример простого **глобального middleware**, который сохраняет текущий маркер в Redis после обработки события:
+
+```python
+from maxapi.filters.middleware import BaseMiddleware
+from maxapi.types import UpdateUnion
+from typing import Any, Awaitable, Callable
+
+
+class SaveMarkerMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[UpdateUnion, dict[str, Any]], Awaitable[Any]],
+        event_object: UpdateUnion,
+        data: dict[str, Any],
+    ) -> Any:
+        result = await handler(event_object, data)
+
+        marker: int | None = event_object.bot.marker_updates
+        if marker is not None:
+            await save_marker(str(marker))
+
+        return result
+```
+
+Использование (при старте загрузили маркер, установили через `set_marker_updates`, подключили middleware):
+
+- при запуске загрузить маркер и установить через `bot.set_marker_updates(...)`, например в `async main()`:
+
+```python
+import asyncio
+from maxapi import Bot, Dispatcher
+
+bot = Bot()
+dp = Dispatcher()
+dp.register_outer_middleware(SaveMarkerMiddleware())
+
+async def main() -> None:
+    marker = await load_marker()  # str | None
+
+    if marker is not None:
+        bot.set_marker_updates(int(marker))
+
+    await dp.start_polling(bot)
+
+
+asyncio.run(main())
+```
+
+- во время работы middleware будет обновлять сохранённый маркер на основании `event_object.bot.marker_updates`.

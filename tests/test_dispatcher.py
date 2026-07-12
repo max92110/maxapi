@@ -1,16 +1,22 @@
 """Тесты для Dispatcher и Router."""
 
+import asyncio
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
-# Core Stuff
-from maxapi import Dispatcher, F
-from maxapi.context import MemoryContext
-from maxapi.dispatcher import Event, Router
+from maxapi.bot import Bot
+from maxapi.context import ContextManager, MemoryContext
+from maxapi.dispatcher import Dispatcher, Event, Router
 from maxapi.enums.update import UpdateType
+from maxapi.filters import F
+from maxapi.filters.command import Command, CommandsInfo
+from maxapi.filters.handler import Handler
+from maxapi.filters.state import StateFilter
 from maxapi.types.updates.bot_started import BotStarted
 from maxapi.types.updates.message_created import MessageCreated
+
+logger = logging.getLogger(__name__)
 
 
 class TestDispatcherInitialization:
@@ -23,9 +29,11 @@ class TestDispatcherInitialization:
         assert dp.use_create_task is False
         assert isinstance(dp.event_handlers, list)
         assert len(dp.event_handlers) == 0
-        assert isinstance(dp.contexts, list)
+        assert isinstance(dp.contexts, dict)
         assert isinstance(dp.routers, list)
-        assert isinstance(dp.middlewares, list)
+        assert isinstance(dp.outer_middlewares, list)
+        assert isinstance(dp.fsm, ContextManager)
+        assert dp.fsm.dispatcher is dp
         assert dp.bot is None
         assert dp.polling is False
 
@@ -71,8 +79,8 @@ class TestDispatcherHandlers:
         """Тест регистрации обработчика message_created."""
 
         @dispatcher.message_created()
-        async def _(event: MessageCreated):
-            pass
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
 
         assert len(dispatcher.event_handlers) == 1
         handler = dispatcher.event_handlers[0]
@@ -82,12 +90,12 @@ class TestDispatcherHandlers:
         """Тест регистрации нескольких обработчиков."""
 
         @dispatcher.message_created()
-        async def handler1(event: MessageCreated):
-            pass
+        async def _handler1(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
 
         @dispatcher.bot_started()
-        async def handler2(event: BotStarted):
-            pass
+        async def _handler2(event: BotStarted):
+            logger.debug("Получено событие: %s", event)
 
         assert len(dispatcher.event_handlers) == 2
 
@@ -95,8 +103,8 @@ class TestDispatcherHandlers:
         """Тест регистрации обработчика с фильтром."""
 
         @dispatcher.message_created(F.text == "test")
-        async def _(event: MessageCreated):
-            pass
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
 
         assert len(dispatcher.event_handlers) == 1
         handler = dispatcher.event_handlers[0]
@@ -106,10 +114,87 @@ class TestDispatcherHandlers:
         """Тест регистрации обработчика on_started."""
 
         @dispatcher.on_started()
-        async def on_started():
-            pass
+        async def _on_started():
+            logger.debug("Бот запущен")
 
         assert dispatcher.on_started_func is not None
+
+
+class TestPrepareHandlers:
+    @staticmethod
+    def make_handler_with_doc(commands, info):
+        def func(): ...
+
+        func.__doc__ = f"""
+        commands_info: {info}
+        """
+        return Handler(
+            Command(commands),
+            func_event=func,
+            update_type=UpdateType.ON_STARTED,
+        )
+
+    def test_prepare_handlers_assigns_bot_and_extracts_commands(self):
+        bot = Bot(token="test")
+        dp = Dispatcher()
+        router = Router("r1")
+
+        handler = self.make_handler_with_doc("start", "Запустить бота")
+        router.event_handlers.append(handler)
+
+        dp.routers.append(router)
+
+        # до подготовки bot ещё не присвоен
+        assert router.bot is None
+        assert bot.commands == []
+
+        dp._prepare_handlers(bot)
+
+        # после подготовки router должен иметь ссылку на bot
+        assert router.bot is bot
+
+        # команды из handler должны быть добавлены в bot.commands
+        assert bot.commands == [
+            CommandsInfo(commands=["start"], info="Запустить бота")
+        ]
+
+    def test_prepare_handlers_multiple_routers_and_handlers(self):
+        bot = Bot(token="test")
+        dp = Dispatcher()
+
+        r1 = Router("r1")
+        r2 = Router("r2")
+
+        h1 = self.make_handler_with_doc("a", "info1")
+        h2 = self.make_handler_with_doc(["b", "c"], "info2")
+
+        r1.event_handlers.append(h1)
+        r2.event_handlers.append(h2)
+
+        dp.routers.extend([r1, r2])
+
+        dp._prepare_handlers(bot)
+
+        assert r1.bot is bot
+        assert r2.bot is bot
+
+        # порядок добавления соответствует обходу роутеров и обработчиков
+        assert bot.commands == [
+            CommandsInfo(commands=["a"], info="info1"),
+            CommandsInfo(commands=["b", "c"], info="info2"),
+        ]
+
+    def test_prepare_handlers_with_no_event_handlers_does_nothing(self):
+        bot = Bot(token="test")
+        dp = Dispatcher()
+        router = Router("r1")
+
+        dp.routers.append(router)
+
+        dp._prepare_handlers(bot)
+
+        assert router.bot is bot
+        assert bot.commands == []
 
 
 class TestDispatcherRouters:
@@ -131,48 +216,11 @@ class TestDispatcherRouters:
         router = Router(router_id="test_router")
 
         @router.message_created()
-        async def handler(event: MessageCreated):
-            pass
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
 
         dispatcher.include_routers(router)
         assert len(router.event_handlers) == 1
-
-
-class TestDispatcherMiddleware:
-    """Тесты middleware."""
-
-    def test_add_middleware(self, dispatcher):
-        """Тест добавления middleware."""
-        # Core Stuff
-        from maxapi.filters.middleware import BaseMiddleware
-
-        class TestMiddleware(BaseMiddleware):
-            async def __call__(self, handler, event, data):
-                return await handler(event, data)
-
-        middleware = TestMiddleware()
-        dispatcher.middleware(middleware)
-
-        assert len(dispatcher.middlewares) == 1
-        assert dispatcher.middlewares[0] == middleware
-
-    def test_add_outer_middleware(self, dispatcher):
-        """Тест добавления outer middleware."""
-        # Core Stuff
-        from maxapi.filters.middleware import BaseMiddleware
-
-        class TestMiddleware(BaseMiddleware):
-            async def __call__(self, handler, event, data):
-                return await handler(event, data)
-
-        middleware1 = TestMiddleware()
-        middleware2 = TestMiddleware()
-
-        dispatcher.middleware(middleware1)
-        dispatcher.outer_middleware(middleware2)
-
-        assert dispatcher.middlewares[0] == middleware2
-        assert dispatcher.middlewares[1] == middleware1
 
 
 class TestDispatcherFilters:
@@ -185,6 +233,7 @@ class TestDispatcherFilters:
 
         class TestFilter(BaseFilter):
             async def __call__(self, event):
+                logger.debug("Получено событие: %s", event)
                 return True
 
         filter_obj = TestFilter()
@@ -199,7 +248,7 @@ class TestDispatcherContext:
 
     def test_get_memory_context_new(self, dispatcher):
         """Тест получения нового контекста."""
-        context = dispatcher._Dispatcher__get_memory_context(12345, 67890)
+        context = dispatcher._Dispatcher__get_context(12345, 67890)
 
         assert isinstance(context, MemoryContext)
         assert context.chat_id == 12345
@@ -208,19 +257,119 @@ class TestDispatcherContext:
 
     def test_get_memory_context_existing(self, dispatcher):
         """Тест получения существующего контекста."""
-        context1 = dispatcher._Dispatcher__get_memory_context(12345, 67890)
-        context2 = dispatcher._Dispatcher__get_memory_context(12345, 67890)
+        context1 = dispatcher._Dispatcher__get_context(12345, 67890)
+        context2 = dispatcher._Dispatcher__get_context(12345, 67890)
 
         assert context1 is context2
         assert len(dispatcher.contexts) == 1
 
     def test_get_memory_context_different_ids(self, dispatcher):
         """Тест получения контекстов для разных ID."""
-        context1 = dispatcher._Dispatcher__get_memory_context(12345, 67890)
-        context2 = dispatcher._Dispatcher__get_memory_context(54321, 98765)
+        context1 = dispatcher._Dispatcher__get_context(12345, 67890)
+        context2 = dispatcher._Dispatcher__get_context(54321, 98765)
 
         assert context1 is not context2
         assert len(dispatcher.contexts) == 2
+
+    def test_fsm_get_context_by_ids(self, dispatcher):
+        """dp.fsm.get_context возвращает контекст по идентификаторам."""
+        context = dispatcher.fsm.get_context(
+            chat_id=12345,
+            user_id=67890,
+        )
+
+        assert isinstance(context, MemoryContext)
+        assert context is dispatcher._Dispatcher__get_context(12345, 67890)
+
+    def test_router_fsm_is_not_available(self):
+        """router.fsm явно запрещён, чтобы не создать отдельное хранилище."""
+        router = Router()
+
+        with pytest.raises(RuntimeError, match=r"Используйте dp\.fsm"):
+            _ = router.fsm
+
+        assert router.contexts == {}
+
+    async def test_fsm_manager_context_methods(self, dispatcher):
+        """dp.fsm проксирует основные методы контекста."""
+        await dispatcher.fsm.set_state(
+            chat_id=12345,
+            user_id=67890,
+            state="Form:name",
+        )
+        await dispatcher.fsm.set_data(
+            chat_id=12345,
+            user_id=67890,
+            data={"name": "Max"},
+        )
+        updated_data = await dispatcher.fsm.update_data(
+            chat_id=12345,
+            user_id=67890,
+            age=7,
+        )
+
+        state = await dispatcher.fsm.get_state(
+            chat_id=12345,
+            user_id=67890,
+        )
+        data = await dispatcher.fsm.get_data(
+            chat_id=12345,
+            user_id=67890,
+        )
+
+        assert state == "Form:name"
+        assert data == {"name": "Max", "age": 7}
+        assert updated_data == data
+
+        await dispatcher.fsm.clear(chat_id=12345, user_id=67890)
+
+        assert (
+            await dispatcher.fsm.get_state(
+                chat_id=12345,
+                user_id=67890,
+            )
+            is None
+        )
+        assert (
+            await dispatcher.fsm.get_data(
+                chat_id=12345,
+                user_id=67890,
+            )
+            == {}
+        )
+
+    async def test_fsm_manager_update_data_accepts_reserved_keys(
+        self, dispatcher
+    ):
+        """data позволяет записывать ключи, занятые параметрами helper."""
+        updated_data = await dispatcher.fsm.update_data(
+            chat_id=12345,
+            user_id=67890,
+            data={"chat_id": "stored", "user_id": "stored"},
+            name="Max",
+        )
+
+        assert updated_data == {
+            "chat_id": "stored",
+            "user_id": "stored",
+            "name": "Max",
+        }
+
+    def test_get_memory_context_recreates_expired_context(self):
+        """Просроченный context не должен переиспользоваться."""
+        current_time = {"value": 0.0}
+        dispatcher = Dispatcher(ttl=0.01)
+
+        with patch(
+            "maxapi.context.ttl.monotonic",
+            side_effect=lambda: current_time["value"],
+        ):
+            context1 = dispatcher._Dispatcher__get_context(12345, 67890)
+            current_time["value"] = 0.02
+            context2 = dispatcher._Dispatcher__get_context(12345, 67890)
+
+        assert context1 is not context2
+        assert len(dispatcher.contexts) == 1
 
 
 class TestDispatcherMiddlewareChain:
@@ -243,7 +392,9 @@ class TestDispatcherMiddlewareChain:
                 call_order.append(2)
                 return await handler(event, data)
 
-        async def handler(event, data):
+        async def _handler(event, data):
+            logger.debug("Получено событие: %s и данные %s", event, data)
+            await asyncio.sleep(0)
             call_order.append(3)
             return "result"
 
@@ -251,14 +402,14 @@ class TestDispatcherMiddlewareChain:
         middleware2 = Middleware2()
 
         chain = dispatcher.build_middleware_chain(
-            [middleware1, middleware2], handler
+            [middleware1, middleware2], _handler
         )
 
-        # Проверяем, что цепочка создана (не вызываем, так как нужен реальный event)
+        # Проверяем, что цепочка создана
+        # (не вызываем, так как нужен реальный event)
         assert callable(chain)
 
 
-@pytest.mark.asyncio
 class TestDispatcherAsync:
     """Асинхронные тесты Dispatcher."""
 
@@ -277,7 +428,7 @@ class TestDispatcherAsync:
 
             await dispatcher.check_me()
 
-            assert bot._me == mock_me
+            assert bot.me == mock_me
             mock_get_me.assert_called_once()
 
     async def test_process_base_filters(
@@ -289,6 +440,7 @@ class TestDispatcherAsync:
 
         class TestFilter(BaseFilter):
             async def __call__(self, event):
+                logger.debug("Получено событие: %s", event)
                 return {"test_key": "test_value"}
 
         filter_obj = TestFilter()
@@ -310,6 +462,7 @@ class TestDispatcherAsync:
 
         class TestFilter(BaseFilter):
             async def __call__(self, event):
+                logger.debug("Получено событие: %s", event)
                 return False
 
         filter_obj = TestFilter()
@@ -319,4 +472,1498 @@ class TestDispatcherAsync:
             sample_message_created_event, dispatcher.base_filters
         )
 
-        assert result is False
+        assert result is None
+
+    async def test_process_base_filters_passes_context_and_raw_state(
+        self, dispatcher, sample_message_created_event, sample_context
+    ):
+        """BaseFilter получает context/raw_state только если объявил их."""
+        from maxapi.filters.filter import BaseFilter
+
+        received: dict = {}
+
+        class ContextFilter(BaseFilter):
+            async def __call__(self, event, context=None, raw_state=None):
+                received["event"] = event
+                received["context"] = context
+                received["raw_state"] = raw_state
+                return True
+
+        result = await dispatcher.process_base_filters(
+            sample_message_created_event,
+            [ContextFilter()],
+            data={"context": sample_context, "raw_state": "Form:name"},
+        )
+
+        assert result == {}
+        assert received == {
+            "event": sample_message_created_event,
+            "context": sample_context,
+            "raw_state": "Form:name",
+        }
+
+    async def test_process_base_filters_chains_returned_data(
+        self, dispatcher, sample_message_created_event
+    ):
+        """dict от одного BaseFilter доступен следующему фильтру."""
+        from maxapi.filters.filter import BaseFilter
+
+        class FirstFilter(BaseFilter):
+            async def __call__(self, event):
+                return {"answer": 42}
+
+        class SecondFilter(BaseFilter):
+            async def __call__(self, event, answer: int | None = None):
+                return {"seen_answer": answer}
+
+        result = await dispatcher.process_base_filters(
+            sample_message_created_event,
+            [FirstFilter(), SecondFilter()],
+        )
+
+        assert result == {"answer": 42, "seen_answer": 42}
+
+    async def test_process_base_filters_keeps_event_only_filters_compatible(
+        self, dispatcher, sample_message_created_event, sample_context
+    ):
+        """Старые фильтры с __call__(event) не получают лишние kwargs."""
+        from maxapi.filters.filter import BaseFilter
+
+        received = []
+
+        class OldStyleFilter(BaseFilter):
+            async def __call__(self, event):
+                received.append(event)
+                return True
+
+        result = await dispatcher.process_base_filters(
+            sample_message_created_event,
+            [OldStyleFilter()],
+            data={"context": sample_context, "raw_state": "state"},
+        )
+
+        assert result == {}
+        assert received == [sample_message_created_event]
+
+    async def test_process_base_filters_does_not_duplicate_event_kwarg(
+        self, dispatcher, sample_message_created_event
+    ):
+        """Фильтр с **kwargs не получает event вторым keyword-аргументом."""
+        from maxapi.filters.filter import BaseFilter
+
+        received = []
+
+        class FirstFilter(BaseFilter):
+            async def __call__(self, event):
+                return {"event": "shadowed", "payload": 42}
+
+        class KwargsFilter(BaseFilter):
+            async def __call__(self, event, **kwargs):
+                received.append((event, kwargs))
+                return True
+
+        result = await dispatcher.process_base_filters(
+            sample_message_created_event,
+            [FirstFilter(), KwargsFilter()],
+        )
+
+        assert result == {"event": "shadowed", "payload": 42}
+        assert received == [(sample_message_created_event, {"payload": 42})]
+
+    async def test_process_base_filters_caches_filter_signature(
+        self, dispatcher, sample_message_created_event, monkeypatch
+    ):
+        """Сигнатура BaseFilter не разбирается заново на каждый вызов."""
+        import maxapi.dispatcher as dp_module
+        from maxapi.filters.filter import BaseFilter
+
+        dp_module._get_filter_kwarg_spec.cache_clear()
+        calls = 0
+        original_signature = dp_module.inspect.signature
+
+        class CachedFilter(BaseFilter):
+            async def __call__(self, event, raw_state=None):
+                return {"seen_state": raw_state}
+
+        def spy_signature(obj, *args, **kwargs):
+            nonlocal calls
+            if obj is CachedFilter.__call__:
+                calls += 1
+            return original_signature(obj, *args, **kwargs)
+
+        monkeypatch.setattr(dp_module.inspect, "signature", spy_signature)
+
+        filter_obj = CachedFilter()
+        for _ in range(2):
+            result = await dispatcher.process_base_filters(
+                sample_message_created_event,
+                [filter_obj],
+                data={"raw_state": "Form:name"},
+            )
+            assert result == {"seen_state": "Form:name"}
+
+        assert calls == 1
+        dp_module._get_filter_kwarg_spec.cache_clear()
+
+
+class TestDispatcherSubscriptions:
+    async def test_check_subscriptions_no_subscriptions(
+        self, dispatcher, bot, caplog
+    ):
+        """Если подписок нет, предупреждение не логируется."""
+        dispatcher.bot = bot
+        bot.get_subscriptions = AsyncMock(return_value=Mock(subscriptions=[]))
+
+        caplog.set_level("WARNING")
+        await dispatcher._check_subscriptions(bot)
+
+        # Проверяем, что предупреждение с ключевой фразой не встречается
+        assert not any(
+            (
+                record.levelname == "WARNING"
+                and "БОТ ИГНОРИРУЕТ POLLING!" in record.getMessage()
+            )
+            for record in caplog.records
+        )
+
+    async def test_check_subscriptions_warns_when_subscriptions(
+        self, dispatcher, bot, caplog
+    ):
+        """Если подписки есть, логируется предупреждение с URL'ами."""
+        dispatcher.bot = bot
+        subs = [Mock(url="https://a"), Mock(url="https://b")]
+        bot.get_subscriptions = AsyncMock(
+            return_value=Mock(subscriptions=subs)
+        )
+
+        caplog.set_level("WARNING")
+        await dispatcher._check_subscriptions(bot)
+
+        warns = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warns, "Ожидалось предупреждение при найденных подписках"
+
+        # Проверяем текст предупреждения и наличие URL'ов
+        assert any("БОТ ИГНОРИРУЕТ POLLING!" in r.getMessage() for r in warns)
+        joined = ", ".join([s.url for s in subs])
+        assert any(joined in r.getMessage() for r in warns)
+
+
+class TestDispatcherReady:
+    async def test_ready_triggers_subscriptions_and_prepare_and_on_started(
+        self, dispatcher, bot
+    ):
+        """Если включён polling и auto_check_subscriptions,
+        вызываются проверки подписок, check_me, prepare и on_started.
+        """
+        dispatcher.polling = True
+        bot.auto_check_subscriptions = True
+
+        # Подменяем методы, чтобы отследить вызовы
+        dispatcher._check_subscriptions = AsyncMock()
+        dispatcher.check_me = AsyncMock()
+        dispatcher._prepare_handlers = Mock()
+        dispatcher.on_started_func = AsyncMock()
+
+        # Вызов приватного метода __ready
+        await dispatcher._Dispatcher__ready(bot)
+
+        # Убедимся, что бот присвоен и бот знает диспетчера
+        assert dispatcher.bot is bot
+        assert bot.dispatcher is dispatcher
+
+        # Проверяем, что были вызваны ожидаемые методы
+        dispatcher._check_subscriptions.assert_called()
+        dispatcher.check_me.assert_called()
+        dispatcher._prepare_handlers.assert_called_once_with(bot)
+        dispatcher.on_started_func.assert_called()
+
+        # Dispatcher должен добавить себя в список роутеров
+        assert dispatcher in dispatcher.routers
+
+    async def test_ready_skips_subscriptions_when_polling_disabled(
+        self, dispatcher, bot
+    ):
+        """Если polling отключён, проверка подписок не выполняется."""
+        dispatcher.polling = False
+        bot.auto_check_subscriptions = True
+
+        dispatcher._check_subscriptions = AsyncMock()
+        dispatcher.check_me = AsyncMock()
+        dispatcher._prepare_handlers = Mock()
+        dispatcher.on_started_func = None
+
+        await dispatcher._Dispatcher__ready(bot)
+
+        # _check_subscriptions не должен вызываться
+        dispatcher._check_subscriptions.assert_not_called()
+
+        # Остальные шаги должны выполниться
+        dispatcher.check_me.assert_called()
+        dispatcher._prepare_handlers.assert_called_once_with(bot)
+        assert dispatcher in dispatcher.routers
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+
+def _setup_for_handle(dispatcher: Dispatcher, bot: Bot) -> None:
+    """Настраивает dispatcher для тестирования полного dispatch-пайплайна."""
+    dispatcher.routers.append(dispatcher)
+    dispatcher._prepare_handlers(bot)
+    dispatcher._global_mw_chain = dispatcher.build_middleware_chain(
+        dispatcher.outer_middlewares, dispatcher._process_event
+    )
+
+
+# ===========================================================================
+# Полный пайплайн handle → роутеры → обработчик
+# ===========================================================================
+
+
+class TestHandlePipeline:
+    """Тесты полного пайплайна dispatch."""
+
+    async def test_handle_dispatches_to_matching_handler(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """handle() находит и вызывает подходящий обработчик."""
+        handled = []
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+            handled.append(event)
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(handled) == 1
+        assert handled[0] is fixture_message_created
+
+    async def test_handle_no_matching_handler_logs_ignored(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """
+        handle() завершается без ошибки, если нет
+        подходящего обработчика.
+        """
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)  # не должно падать
+
+    async def test_handle_uses_cached_router_entries_when_ready(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """При _ready=True _cached_router_entries строится один раз и
+        переиспользуется при повторных вызовах handle()."""
+        handled = []
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            handled.append(event)
+
+        _setup_for_handle(dispatcher, bot)
+        dispatcher._ready = True
+        # _prepare_handlers уже заполнил кеш; сбрасываем, чтобы
+        # покрыть ветку «кеш пуст → строится через _build_dispatch_entries()»
+        dispatcher._cached_router_entries = None
+
+        # Первый вызов строит и сохраняет список записей в кеш.
+        await dispatcher.handle(fixture_message_created)
+        cached = dispatcher._cached_router_entries
+        assert cached is not None
+
+        # Повторный вызов использует уже заполненный _cached_router_entries.
+        await dispatcher.handle(fixture_message_created)
+        assert dispatcher._cached_router_entries is cached
+
+        assert len(handled) == 2
+
+    async def test_iter_dispatch_entries_is_lazy(self, dispatcher, bot):
+        """_iter_dispatch_entries() возвращает ленивый генератор,
+        а не материализованный список."""
+        import types
+
+        _setup_for_handle(dispatcher, bot)
+
+        gen = dispatcher._iter_dispatch_entries()
+        assert isinstance(gen, types.GeneratorType)
+
+        # Генератор выдаёт кортежи (router, outer_mw, filters, base_filters)
+        entries = list(gen)
+        assert len(entries) >= 1
+        _router, outer_mw, filters, base_filters = entries[0]
+        assert isinstance(outer_mw, list)
+        assert isinstance(filters, list)
+        assert isinstance(base_filters, list)
+
+    async def test_not_ready_does_not_cache_entries(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """При _ready=False _cached_router_entries не заполняется
+        в ходе handle() — кеш остаётся None."""
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            pass
+
+        _setup_for_handle(dispatcher, bot)
+        # Сбрасываем кеш, выставленный _prepare_handlers
+        dispatcher._cached_router_entries = None
+        assert dispatcher._ready is False
+
+        await dispatcher.handle(fixture_message_created)
+
+        # После handle() при _ready=False кеш по-прежнему None
+        assert dispatcher._cached_router_entries is None
+
+    async def test_handle_handler_state_mismatch_skips_and_returns_false(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Если handler не подходит по state, он пропускается (continue),
+        и _run_router_handlers возвращает False."""
+
+        class MyState:
+            pass
+
+        required_state = MyState()
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+
+        # Назначаем состояние, которое не совпадёт (current_state = None)
+        dispatcher.event_handlers[-1].states = [required_state]
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)  # не должно падать
+
+    async def test_handle_dispatches_with_legacy_state_arg(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Старый синтаксис @dp.message_created(Form.name) работает."""
+        from maxapi.context.state_machine import State, StatesGroup
+
+        class Form(StatesGroup):
+            name = State()
+
+        handled = []
+        context = dispatcher._Dispatcher__get_context(
+            *fixture_message_created.get_ids()
+        )
+        await context.set_state(Form.name)
+
+        @dispatcher.message_created(Form.name)
+        async def _handler(event: MessageCreated):
+            handled.append(event)
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert handled == [fixture_message_created]
+
+    async def test_handle_dispatches_with_states_kwarg(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """states=[...] остаётся совместимым API."""
+        from maxapi.context.state_machine import State, StatesGroup
+
+        class Form(StatesGroup):
+            name = State()
+
+        handled = []
+        context = dispatcher._Dispatcher__get_context(
+            *fixture_message_created.get_ids()
+        )
+        await context.set_state(Form.name)
+
+        @dispatcher.message_created(states=[Form.name])
+        async def _handler(event: MessageCreated):
+            handled.append(event)
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert handled == [fixture_message_created]
+
+    async def test_handle_dispatches_with_state_filter(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Новый StateFilter работает как обычный BaseFilter."""
+        from maxapi.context.state_machine import State, StatesGroup
+
+        class Form(StatesGroup):
+            name = State()
+
+        handled = []
+        context = dispatcher._Dispatcher__get_context(
+            *fixture_message_created.get_ids()
+        )
+        await context.set_state(Form.name)
+
+        @dispatcher.message_created(StateFilter(Form.name))
+        async def _handler(event: MessageCreated, raw_state):
+            handled.append((event, raw_state))
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert handled == [(fixture_message_created, Form.name)]
+
+    async def test_handle_catches_handler_exception(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """handle() перехватывает исключение обработчика и логирует."""
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            raise RuntimeError("ошибка обработчика")
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)  # не должно всплывать
+
+    async def test_handle_logs_handler_exception_with_str_and_cause(
+        self, dispatcher, bot, fixture_message_created, monkeypatch
+    ):
+        """
+        handle() логирует HandlerException через __str__ и передаёт
+        оригинальное исключение как exc_info.
+        """
+        import maxapi.dispatcher as dp_module
+        from maxapi.exceptions.dispatcher import HandlerException
+
+        original_cause = RuntimeError("оригинальная ошибка")
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            raise original_cause
+
+        _setup_for_handle(dispatcher, bot)
+
+        logged_calls: list[tuple] = []
+
+        def fake_exception(msg, *args, **kwargs):
+            logged_calls.append((msg, args, kwargs))
+
+        monkeypatch.setattr(dp_module.logger_dp, "exception", fake_exception)
+
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(logged_calls) == 1
+        msg, args, kwargs = logged_calls[0]
+        assert msg == "Ошибка в обработчике: %s"
+        # args[0] — экземпляр HandlerException, логируется через __str__
+        assert isinstance(args[0], HandlerException)
+        assert args[0].cause is original_cause
+        # exc_info передаётся как оригинальное исключение, не HandlerException
+        assert kwargs.get("exc_info") is original_cause
+
+    async def test_handle_catches_middleware_exception(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """
+        handle() перехватывает MiddlewareException
+        из глобального middleware.
+        """
+        from maxapi.filters.middleware import BaseMiddleware
+
+        class FailingMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                raise RuntimeError("сбой middleware")
+
+        dispatcher.register_outer_middleware(FailingMiddleware())
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)  # не должно всплывать
+
+    async def test_outer_middleware_receives_handler_exception(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """
+        Outer middleware получает HandlerException при ошибке хендлера.
+
+        Оригинальное исключение доступно через HandlerException.cause.
+        """
+        from maxapi.exceptions.dispatcher import HandlerException
+        from maxapi.filters.middleware import BaseMiddleware
+
+        original_cause = RuntimeError("ошибка в хендлере")
+        caught: list[BaseException] = []
+
+        class CatchingOuterMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                try:
+                    await handler(event, data)
+                except HandlerException as e:
+                    caught.append(e)
+                    raise
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            raise original_cause
+
+        dispatcher.register_outer_middleware(CatchingOuterMiddleware())
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(caught) == 1
+        assert isinstance(caught[0], HandlerException)
+        assert caught[0].cause is original_cause
+
+    async def test_outer_middleware_swallows_handler_exception_no_ignored_log(
+        self, dispatcher, bot, fixture_message_created, monkeypatch
+    ):
+        """
+        Если outer middleware поглощает HandlerException, handle() не должен
+        логировать "Проигнорировано" — хендлер ведь был найден и запущен.
+        """
+        import contextlib
+
+        import maxapi.dispatcher as dp_module
+        from maxapi.exceptions.dispatcher import HandlerException
+        from maxapi.filters.middleware import BaseMiddleware
+
+        ignored_logs: list[str] = []
+        original_info = dp_module.logger_dp.info
+
+        def fake_info(msg, *args, **kwargs):
+            if "Проигнорировано" in msg:
+                ignored_logs.append(msg)
+            else:
+                original_info(msg, *args, **kwargs)
+
+        monkeypatch.setattr(dp_module.logger_dp, "info", fake_info)
+
+        class SwallowingMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                with contextlib.suppress(HandlerException):
+                    await handler(event, data)
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            raise RuntimeError("ошибка")
+
+        dispatcher.register_outer_middleware(SwallowingMiddleware())
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert ignored_logs == [], (
+            "handle() не должен логировать 'Проигнорировано' "
+            "когда middleware поглотила HandlerException"
+        )
+
+    async def test_inner_middleware_receives_raw_exception(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """
+        Inner middleware получает оригинальное исключение из хендлера,
+        до того как оно оборачивается в HandlerException.
+        """
+        from maxapi.filters.middleware import BaseMiddleware
+
+        original_cause = RuntimeError("ошибка в хендлере")
+        caught: list[BaseException] = []
+
+        class CatchingInnerMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                try:
+                    await handler(event, data)
+                except RuntimeError as e:
+                    caught.append(e)
+                    raise
+
+        @dispatcher.message_created(CatchingInnerMiddleware())
+        async def _handler(event: MessageCreated):
+            raise original_cause
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(caught) == 1
+        assert caught[0] is original_cause
+
+
+# ===========================================================================
+# Вспомогательные методы dispatcher
+# ===========================================================================
+
+
+class TestDispatcherHelpers:
+    """Тесты вспомогательных методов Dispatcher."""
+
+    def test_lru_context_move_to_end(self, dispatcher):
+        """Повторный доступ к контексту перемещает его в конец (LRU hit)."""
+        dispatcher._Dispatcher__get_context(1, 1)
+        dispatcher._Dispatcher__get_context(2, 2)
+
+        # Обращаемся к (1,1) — должен переместиться в конец
+        dispatcher._Dispatcher__get_context(1, 1)
+
+        keys = list(dispatcher.contexts.keys())
+        assert keys[-1] == (1, 1)
+
+    def test_lru_context_evicts_oldest_when_full(self, dispatcher):
+        """Когда кеш переполнен, самый старый контекст вытесняется."""
+        import maxapi.dispatcher as dp_module
+
+        original = dp_module.CONTEXTS_MAX_SIZE
+        dp_module.CONTEXTS_MAX_SIZE = 2
+        try:
+            dispatcher._Dispatcher__get_context(1, 1)
+            dispatcher._Dispatcher__get_context(2, 2)
+            # Третий вызов должен вытеснить (1, 1)
+            dispatcher._Dispatcher__get_context(3, 3)
+            assert (1, 1) not in dispatcher.contexts
+            assert len(dispatcher.contexts) == 2
+        finally:
+            dp_module.CONTEXTS_MAX_SIZE = original
+
+    def test_find_matching_handlers_without_index(self, dispatcher):
+        """Fallback на линейный поиск когда handlers_by_type не построен."""
+        router = Router(router_id="r1")
+
+        @router.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+
+        router.handlers_by_type = None  # индекс не построен
+
+        result = dispatcher._find_matching_handlers(
+            router, UpdateType.MESSAGE_CREATED
+        )
+        assert len(result) == 1
+
+    async def test_check_handler_match_state_mismatch(
+        self, dispatcher, fixture_message_created
+    ):
+        """Возвращает None когда текущее состояние не совпадает."""
+
+        class State:
+            pass
+
+        state_a, state_b = State(), State()
+        handler = Handler(
+            func_event=lambda e: None,
+            update_type=UpdateType.MESSAGE_CREATED,
+        )
+        handler.states = [state_a]
+
+        result = await dispatcher._check_handler_match(
+            handler=handler,
+            event=fixture_message_created,
+            current_state=state_b,
+        )
+        assert result is None
+
+    async def test_check_handler_match_reuses_prepared_state_filter(
+        self, dispatcher, fixture_message_created
+    ):
+        """Legacy states используют подготовленный StateFilter."""
+
+        class State:
+            pass
+
+        state = State()
+        handler = Handler(
+            func_event=lambda e: None,
+            update_type=UpdateType.MESSAGE_CREATED,
+            states=[state],
+        )
+        state_filter = handler.state_filter
+
+        assert state_filter is not None
+
+        for _ in range(2):
+            result = await dispatcher._check_handler_match(
+                handler=handler,
+                event=fixture_message_created,
+                current_state=state,
+            )
+            assert result == {}
+            assert handler.state_filter is state_filter
+
+    def test_get_middleware_title_with_func_attr(self, dispatcher):
+        """_get_middleware_title берёт имя из chain.func.__class__.__name__."""
+        import functools
+
+        from maxapi.filters.middleware import BaseMiddleware
+
+        class MyMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                return await handler(event, data)
+
+        partial_chain = functools.partial(MyMiddleware(), None)
+        title = dispatcher._get_middleware_title(partial_chain)
+        assert "MyMiddleware" in title
+
+    def test_get_middleware_title_without_func_attr(self, dispatcher):
+        """_get_middleware_title берёт __name__ когда нет .func."""
+
+        async def my_handler(event, data):
+            await asyncio.sleep(0)
+
+        title = dispatcher._get_middleware_title(my_handler)
+        assert "my_handler" in title
+
+
+# ===========================================================================
+# _execute_handler — обёртка исключения
+# ===========================================================================
+
+
+class TestExecuteHandler:
+    async def test_execute_handler_wraps_exception_in_handler_exception(
+        self, dispatcher, fixture_message_created
+    ):
+        """_execute_handler оборачивает RuntimeError в HandlerException."""
+        from maxapi.exceptions.dispatcher import HandlerException
+
+        async def _failing(event):
+            raise ValueError("тест")
+
+        handler = Handler(
+            func_event=_failing,
+            update_type=UpdateType.MESSAGE_CREATED,
+        )
+        handler.func_args = frozenset()
+        handler.mw_chain = None
+
+        memory_context = dispatcher._Dispatcher__get_context(1, 2)
+
+        with pytest.raises(HandlerException):
+            await dispatcher._execute_handler(
+                handler=handler,
+                event=fixture_message_created,
+                data={},
+                handler_middlewares=[],
+                memory_context=memory_context,
+                current_state=None,
+                router_id="test",
+                process_info="test",
+            )
+
+
+# ===========================================================================
+# stop_polling
+# ===========================================================================
+
+
+class TestStopPolling:
+    async def test_stop_polling_sets_polling_false(self, dispatcher):
+        dispatcher.polling = True
+        await dispatcher.stop_polling()
+        assert dispatcher.polling is False
+
+    async def test_stop_polling_already_stopped_no_error(self, dispatcher):
+        dispatcher.polling = False
+        await dispatcher.stop_polling()  # не должно падать
+
+    async def test_stop_polling_waits_for_background_tasks(self, dispatcher):
+        """stop_polling дожидается завершения фоновых задач."""
+        completed = []
+
+        async def _work():
+            await asyncio.sleep(0)
+            completed.append(1)
+
+        dispatcher.polling = True
+        task = asyncio.create_task(_work())
+        dispatcher._background_tasks.add(task)
+        task.add_done_callback(dispatcher._background_tasks.discard)
+
+        await dispatcher.stop_polling()
+
+        assert completed == [1]
+        assert len(dispatcher._background_tasks) == 0
+
+
+# ===========================================================================
+# handle_raw_response — перехват исключений
+# ===========================================================================
+
+
+class TestHandleRawResponse:
+    async def test_handle_raw_response_catches_handler_exception(
+        self, dispatcher, bot
+    ):
+        """handle_raw_response не всплывает при ошибке обработчика."""
+        dispatcher.bot = bot
+
+        async def _failing(event):
+            raise RuntimeError("raw error")
+
+        handler = Handler(
+            func_event=_failing,
+            update_type=UpdateType.RAW_API_RESPONSE,
+        )
+        dispatcher.event_handlers.append(handler)
+        dispatcher.routers.append(dispatcher)
+        dispatcher._prepare_handlers(bot)
+
+        await dispatcher.handle_raw_response(
+            event_type=UpdateType.RAW_API_RESPONSE,
+            raw_data={"test": "data"},
+        )
+
+
+# ===========================================================================
+# Handler — BaseFilter как позиционный аргумент
+# ===========================================================================
+
+
+class TestHandlerBaseFilterArg:
+    def test_handler_accepts_base_filter_as_positional_arg(self):
+        """Handler принимает BaseFilter позиционным аргументом."""
+        from maxapi.filters.filter import BaseFilter
+
+        class MyFilter(BaseFilter):
+            async def __call__(self, event):
+                logger.debug("Получено событие: %s", event)
+                return True
+
+        filter_obj = MyFilter()
+        handler = Handler(
+            filter_obj,
+            func_event=lambda e: None,
+            update_type=UpdateType.MESSAGE_CREATED,
+        )
+
+        assert filter_obj in handler.base_filters
+
+    def test_handler_accepts_base_middleware_as_positional_arg(self):
+        """Handler принимает BaseMiddleware позиционным аргументом."""
+        from maxapi.filters.middleware import BaseMiddleware
+
+        class MyMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                return await handler(event, data)
+
+        mw = MyMiddleware()
+        handler = Handler(
+            mw,
+            func_event=lambda e: None,
+            update_type=UpdateType.MESSAGE_CREATED,
+        )
+
+        assert mw in handler.middlewares
+
+
+# ===========================================================================
+# _fetch_updates_once — ветки обработки ошибок
+# ===========================================================================
+
+
+class TestFetchUpdatesOnce:
+    """Тесты всех веток _fetch_updates_once."""
+
+    async def test_returns_updates_on_success(self, dispatcher, bot):
+        dispatcher.bot = bot
+        bot.get_updates = AsyncMock(return_value={"updates": [], "marker": 1})
+        result = await dispatcher._fetch_updates_once(bot)
+        assert result == {"updates": [], "marker": 1}
+
+    async def test_asyncio_timeout_returns_none(self, dispatcher, bot):
+        from asyncio.exceptions import TimeoutError as AsyncioTimeoutError
+
+        bot.get_updates = AsyncMock(side_effect=AsyncioTimeoutError())
+        result = await dispatcher._fetch_updates_once(bot)
+        assert result is None
+
+    async def test_max_connection_error_returns_none(self, dispatcher, bot):
+        from maxapi.exceptions.max import MaxConnection
+
+        bot.get_updates = AsyncMock(side_effect=MaxConnection("conn error"))
+        with patch("maxapi.dispatcher.CONNECTION_RETRY_DELAY", 0):
+            result = await dispatcher._fetch_updates_once(bot)
+        assert result is None
+
+    async def test_invalid_token_stops_polling(self, dispatcher, bot):
+        from maxapi.exceptions.max import InvalidToken
+
+        bot.get_updates = AsyncMock(side_effect=InvalidToken("bad token"))
+        dispatcher.polling = True
+        with pytest.raises(InvalidToken):
+            await dispatcher._fetch_updates_once(bot)
+        assert dispatcher.polling is False
+
+    async def test_max_api_error_returns_none(self, dispatcher, bot):
+        from maxapi.exceptions.max import MaxApiError
+
+        bot.get_updates = AsyncMock(side_effect=MaxApiError(400, "api error"))
+        with patch("maxapi.dispatcher.GET_UPDATES_RETRY_DELAY", 0):
+            result = await dispatcher._fetch_updates_once(bot)
+        assert result is None
+
+    async def test_generic_exception_returns_none(self, dispatcher, bot):
+        bot.get_updates = AsyncMock(side_effect=RuntimeError("unexpected"))
+        with patch("maxapi.dispatcher.GET_UPDATES_RETRY_DELAY", 0):
+            result = await dispatcher._fetch_updates_once(bot)
+        assert result is None
+
+
+# ===========================================================================
+# _dispatch_fetched_events — обработка полученных событий
+# ===========================================================================
+
+
+class TestDispatchFetchedEvents:
+    """Тесты _dispatch_fetched_events."""
+
+    async def test_dispatches_events_sequentially(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """События обрабатываются последовательно (use_create_task=False)."""
+        handled = []
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+            handled.append(event)
+
+        dispatcher.bot = bot
+        _setup_for_handle(dispatcher, bot)
+
+        raw = {"updates": [fixture_message_created.model_dump()], "marker": 1}
+
+        with patch(
+            "maxapi.dispatcher.process_update_request",
+            new=AsyncMock(return_value=[fixture_message_created]),
+        ):
+            await dispatcher._dispatch_fetched_events(
+                events=raw,
+                current_timestamp=0,
+                skip_updates=False,
+            )
+
+        assert len(handled) == 1
+
+    async def test_skips_old_events_when_skip_updates_true(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Старые события пропускаются при skip_updates=True."""
+        handled = []
+
+        @dispatcher.message_created()
+        async def _handler(event: MessageCreated):
+            logger.debug("Получено событие: %s", event)
+            handled.append(event)
+
+        dispatcher.bot = bot
+        _setup_for_handle(dispatcher, bot)
+
+        # timestamp события меньше current_timestamp → пропуск
+        future_timestamp = fixture_message_created.timestamp + 1_000_000_000
+
+        with patch(
+            "maxapi.dispatcher.process_update_request",
+            new=AsyncMock(return_value=[fixture_message_created]),
+        ):
+            await dispatcher._dispatch_fetched_events(
+                events={},
+                current_timestamp=future_timestamp,
+                skip_updates=True,
+            )
+
+        assert len(handled) == 0
+
+    async def test_use_create_task_creates_background_task(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """
+        При use_create_task=True событие обрабатывается
+        через asyncio.Task.
+        """
+        dispatcher.use_create_task = True
+        dispatcher.bot = bot
+        _setup_for_handle(dispatcher, bot)
+
+        with patch(
+            "maxapi.dispatcher.process_update_request",
+            new=AsyncMock(return_value=[fixture_message_created]),
+        ):
+            await dispatcher._dispatch_fetched_events(
+                events={},
+                current_timestamp=0,
+                skip_updates=False,
+            )
+            # Даём задаче и её done-callback завершиться
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+        assert len(dispatcher._background_tasks) == 0  # задача завершена
+
+
+# ===========================================================================
+# call_handler — **data передаётся хендлеру
+# ===========================================================================
+
+
+class TestCallHandlerWithKwargs:
+    """Хендлер получает kwargs, возвращённые BaseFilter."""
+
+    async def test_handler_receives_kwargs_from_base_filter(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """BaseFilter возвращает dict → handler получает kwargs."""
+        from maxapi.filters.filter import BaseFilter
+
+        received: dict = {}
+
+        class DataFilter(BaseFilter):
+            async def __call__(self, event):
+                return {"answer": 42}
+
+        @dispatcher.message_created(DataFilter())
+        async def _h(event: MessageCreated, answer: int):
+            received["answer"] = answer
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert received.get("answer") == 42
+
+    async def test_handler_receives_kwargs_from_middleware(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Middleware кладёт ключ в ``data`` → handler получает его как
+        kwarg, несовместимые ключи безопасно отфильтровываются."""
+        from maxapi.filters.middleware import BaseMiddleware
+
+        received: dict = {}
+
+        class InjectingMiddleware(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                # известный handler kwarg + лишний ключ, который
+                # handler не принимает (должен быть отфильтрован)
+                data["user_role"] = "admin"
+                data["unrelated_key"] = "should_be_dropped"
+                return await handler(event, data)
+
+        @dispatcher.message_created()
+        async def _h(event: MessageCreated, user_role: str = "", **_kw):
+            # Явно фиксируем ВСЕ полученные kwargs —
+            # лишних быть не должно
+            received.update({"user_role": user_role, "extra": _kw})
+
+        dispatcher.register_inner_middleware(InjectingMiddleware())
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        # Middleware-инжекция доехала до handler
+        assert received["user_role"] == "admin"
+        # Лишние ключи не просочились
+        assert received["extra"] == {}
+
+    async def test_call_handler_filters_unknown_kwargs(self, dispatcher):
+        """call_handler не передаёт в func_event ключи, которых нет
+        в его аннотациях/func_args (защита от TypeError)."""
+        received: dict = {}
+
+        async def _func(event, known_arg: str):
+            received["known"] = known_arg
+
+        handler = Handler(
+            func_event=_func,
+            update_type=UpdateType.MESSAGE_CREATED,
+        )
+        handler.func_args = frozenset({"event", "known_arg"})
+
+        await dispatcher.call_handler(
+            handler=handler,
+            event_object="evt",
+            data={"known_arg": "ok", "junk": "ignored"},
+        )
+
+        assert received == {"known": "ok"}
+
+
+# ===========================================================================
+# _iter_routers — вложенные роутеры и защита от циклов
+# ===========================================================================
+
+
+class TestIterRoutersNested:
+    """Рекурсивный обход sub-роутеров доходит до вложенных обработчиков."""
+
+    async def test_nested_sub_router_handler_is_dispatched(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Обработчик во вложенном sub-роутере вызывается."""
+        handled = []
+
+        nested = Router(router_id="sub_nested")
+
+        @nested.message_created()
+        async def _h(event: MessageCreated):
+            handled.append(event)
+
+        outer = Router(router_id="sub_outer")
+        outer.include_routers(nested)
+        dispatcher.include_routers(outer)
+
+        _setup_for_handle(dispatcher, bot)
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(handled) == 1
+
+
+class TestIterRoutersCycle:
+    """Цикл в графе роутеров обрабатывается без зависания."""
+
+    def test_cycle_detection_does_not_hang(self, dispatcher):
+        r_a = Router(router_id="cycle_a")
+        r_b = Router(router_id="cycle_b")
+        r_a.include_routers(r_b)
+        r_b.include_routers(r_a)  # цикл
+
+        dispatcher.include_routers(r_a)
+
+        result = list(dispatcher._iter_unique_routers(dispatcher.routers))
+        ids = {r.router_id for r, *_ in result}
+        assert "cycle_a" in ids
+        assert "cycle_b" in ids
+
+
+# ===========================================================================
+# _iter_unique_routers — предупреждение о дублях
+# ===========================================================================
+
+
+class TestDuplicateRouterWarning:
+    """Повторное включение одного и того же роутера логирует предупреждение."""
+
+    def test_warns_on_duplicate_inclusion(self, dispatcher, caplog):
+        router = Router(router_id="dup_router")
+        dispatcher.include_routers(router)
+        dispatcher.include_routers(router)  # дубль
+
+        with caplog.at_level("WARNING", logger="maxapi.dispatcher"):
+            list(
+                dispatcher._iter_unique_routers(
+                    dispatcher.routers, warn_duplicates=True
+                )
+            )
+
+        assert any("dup_router" in r.getMessage() for r in caplog.records)
+
+
+# ===========================================================================
+# Фильтры на уровне роутера
+# ===========================================================================
+
+
+class TestRouterLevelFilters:
+    async def test_failing_magic_filter_skips_router(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """Неподходящий MagicFilter на роутере пропускает весь роутер."""
+        handled = []
+
+        router = Router(router_id="filtered_router")
+        router.filters.append(F.text == "__NEVER_MATCH__")
+
+        @router.message_created()
+        async def _h(event: MessageCreated):
+            handled.append(event)
+
+        dispatcher.include_routers(router)
+        _setup_for_handle(dispatcher, bot)
+
+        await dispatcher.handle(fixture_message_created)
+
+        assert len(handled) == 0
+
+    async def test_router_base_filter_calls_process_base_filters(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        """BaseFilter на роутере вызывается и передаёт данные в обработчик."""
+        from maxapi.filters.filter import BaseFilter
+
+        enriched: dict = {}
+
+        class RouterBaseFilter(BaseFilter):
+            async def __call__(self, event):
+                return {"router_key": "router_val"}
+
+        router = Router(router_id="base_filter_router")
+        router.base_filters.append(RouterBaseFilter())
+
+        @router.message_created()
+        async def _h(event: MessageCreated, router_key: str = ""):
+            enriched["router_key"] = router_key
+
+        dispatcher.include_routers(router)
+        _setup_for_handle(dispatcher, bot)
+
+        await dispatcher.handle(fixture_message_created)
+
+        assert enriched.get("router_key") == "router_val"
+
+
+# ===========================================================================
+# Middleware на уровне роутера
+# ===========================================================================
+
+
+class TestRouterMiddlewareChain:
+    """Middleware, добавленный на роутер, оборачивает его обработчики."""
+
+    async def test_router_middleware_wraps_dispatch(
+        self, dispatcher, bot, fixture_message_created
+    ):
+        from maxapi.filters.middleware import BaseMiddleware
+
+        calls: list = []
+
+        class RouterMW(BaseMiddleware):
+            async def __call__(self, handler, event, data):
+                calls.append("mw")
+                return await handler(event, data)
+
+        router = Router(router_id="mw_router")
+        router.register_outer_middleware(RouterMW())
+
+        @router.message_created()
+        async def _h(event: MessageCreated):
+            calls.append("handler")
+
+        dispatcher.include_routers(router)
+        _setup_for_handle(dispatcher, bot)
+
+        await dispatcher.handle(fixture_message_created)
+
+        assert "mw" in calls
+        assert "handler" in calls
+
+
+# ===========================================================================
+# ClientConnectorError в _dispatch_fetched_events
+# ===========================================================================
+
+
+class TestDispatchFetchedEventsConnectorError:
+    """_dispatch_fetched_events перехватывает сетевые и прочие исключения."""
+
+    async def test_client_connector_error_caught_and_logged(
+        self, dispatcher, bot
+    ):
+        from unittest.mock import Mock
+
+        from aiohttp import ClientConnectorError
+
+        dispatcher.bot = bot
+        _setup_for_handle(dispatcher, bot)
+
+        err = ClientConnectorError(Mock(), ConnectionRefusedError("refused"))
+
+        with (
+            patch(
+                "maxapi.dispatcher.process_update_request",
+                new=AsyncMock(side_effect=err),
+            ),
+            patch("maxapi.dispatcher.CONNECTION_RETRY_DELAY", 0),
+        ):
+            await dispatcher._dispatch_fetched_events(
+                events={"updates": [], "marker": 0},
+                current_timestamp=0,
+                skip_updates=False,
+            )  # не должно всплывать
+
+    async def test_generic_exception_caught_and_logged(self, dispatcher, bot):
+        """Произвольное исключение в _dispatch_fetched_events не всплывает."""
+        dispatcher.bot = bot
+        _setup_for_handle(dispatcher, bot)
+
+        with patch(
+            "maxapi.dispatcher.process_update_request",
+            new=AsyncMock(
+                side_effect=RuntimeError("unexpected dispatch error")
+            ),
+        ):
+            await dispatcher._dispatch_fetched_events(
+                events={"updates": [], "marker": 0},
+                current_timestamp=0,
+                skip_updates=False,
+            )  # не должно всплывать
+
+
+# ===========================================================================
+# start_polling — полный HTTP-цикл через aresponses
+# ===========================================================================
+
+
+class TestStartPollingWithAresponses:
+    """
+    Интеграционный тест start_polling через сетевую эмуляцию (aresponses).
+
+    aresponses перехватывает TCP-соединения на уровне резолвера и
+    перенаправляет их на локальный mock-сервер — никакого реального
+    подключения к platform-api2.max.ru не происходит.
+    """
+
+    async def test_start_polling_calls_http_endpoints_and_stops(
+        self, aresponses
+    ):
+        """
+        Проверяет, что start_polling:
+          1. обращается к /me (check_me)
+          2. первый /updates возвращает 500 → _fetch_updates_once → None
+          3. второй /updates возвращает {} → _dispatch_fetched_events вызван
+        """
+        from aiohttp import web
+        from maxapi.bot import Bot
+        from maxapi.client.default import DefaultConnectionProperties
+
+        bot = Bot(
+            token="polling_test_token",
+            auto_check_subscriptions=False,
+            default_connection=DefaultConnectionProperties(
+                max_retries=0, timeout=5, sock_connect=5
+            ),
+        )
+        dp = Dispatcher()
+
+        # ── Mock GET /me ──────────────────────────────────────────────────
+        aresponses.add(
+            "platform-api2.max.ru",
+            "/me",
+            "get",
+            {
+                "user_id": 42,
+                "first_name": "PollingBot",
+                "is_bot": True,
+                "last_activity_time": 1_700_000_000,
+            },
+        )
+
+        # ── Mock GET /updates (1st): 500 → MaxApiError → returns None ────
+        aresponses.add(
+            "platform-api2.max.ru",
+            "/updates",
+            "get",
+            web.Response(
+                status=500,
+                text='{"code":500,"message":"test_error"}',
+                content_type="application/json",
+            ),
+        )
+
+        # ── Mock GET /updates (2nd): 200 → events dict → dispatch ────────
+        aresponses.add(
+            "platform-api2.max.ru",
+            "/updates",
+            "get",
+            {"updates": [], "marker": 0},
+        )
+
+        # После первого же вызова _dispatch_fetched_events останавливаем цикл
+        async def _stop(events, ts, *, skip_updates):
+            dp.polling = False
+
+        dp._dispatch_fetched_events = _stop
+
+        with patch("maxapi.dispatcher.GET_UPDATES_RETRY_DELAY", 0):
+            await dp.start_polling(bot)
+
+        assert bot.me is not None
+        assert bot.me.user_id == 42
+
+        if bot.session and not bot.session.closed:
+            await bot.session.close()
+
+
+# ===========================================================================
+# startup
+# ===========================================================================
+
+
+class TestStartup:
+    """startup() привязывает бота и подготавливает обработчики."""
+
+    async def test_startup_calls_ready(self, dispatcher, bot):
+        dispatcher.check_me = AsyncMock()
+        dispatcher._prepare_handlers = Mock()
+
+        await dispatcher.startup(bot)
+
+        assert dispatcher.bot is bot
+        assert bot.dispatcher is dispatcher
+        dispatcher.check_me.assert_called_once()
+        dispatcher._prepare_handlers.assert_called_once_with(bot)
+
+
+# ===========================================================================
+# handle_webhook
+# ===========================================================================
+
+
+class TestHandleWebhook:
+    """handle_webhook() создаёт экземпляр webhook-класса и запускает его."""
+
+    async def test_handle_webhook_creates_and_runs_instance(
+        self, dispatcher, bot
+    ):
+        mock_wh_instance = Mock()
+        mock_wh_instance.run = AsyncMock()
+        mock_wh_type = Mock(return_value=mock_wh_instance)
+
+        await dispatcher.handle_webhook(
+            bot,
+            host="localhost",
+            port=8080,
+            path="/hook",
+            webhook_type=mock_wh_type,
+        )
+
+        mock_wh_type.assert_called_once_with(
+            dp=dispatcher, bot=bot, secret=None
+        )
+        mock_wh_instance.run.assert_called_once_with(
+            host="localhost", port=8080, path="/hook"
+        )
+
+
+# ===========================================================================
+# Устаревшее событие — DeprecationWarning
+# ===========================================================================
+
+
+class TestDeprecatedEvent:
+    """Регистрация на устаревшее событие вызывает DeprecationWarning."""
+
+    def test_deprecated_event_emits_deprecation_warning(self):
+        import warnings
+
+        dp = Dispatcher()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+
+            @dp.message_chat_created()
+            async def _h(event):
+                pass
+
+        assert any(issubclass(x.category, DeprecationWarning) for x in w)
+
+
+# ===========================================================================
+# _on_background_task_done — ветка с исключением в задаче
+# ===========================================================================
+
+
+class TestOnBackgroundTaskDone:
+    """_on_background_task_done логирует исключение упавшей задачи."""
+
+    async def test_logs_exception_when_task_has_exception(self, dispatcher):
+        """Callback логирует исключение, если задача завершилась с ошибкой."""
+
+        async def _failing():
+            raise RuntimeError("test error from background task")
+
+        task = asyncio.create_task(_failing())
+        dispatcher._background_tasks.add(task)
+        # Ждём завершения, подавляя исключение
+        await asyncio.gather(task, return_exceptions=True)
+
+        with patch("maxapi.dispatcher.logger_dp") as mock_logger:
+            dispatcher._on_background_task_done(task)
+            mock_logger.exception.assert_called_once()

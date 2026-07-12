@@ -11,18 +11,20 @@ if TYPE_CHECKING:
 
 class GetSubscriptions(BaseConnection):
     """
-    Если ваш бот получает данные через WebHook, этот класс возвращает список всех подписок.
+    Если ваш бот получает данные через WebHook, этот класс возвращает
+    список всех подписок.
 
     https://dev.max.ru/docs-api/methods/GET/subscriptions
 
     Attributes:
-        bot (Bot): Экземпляр бота
+        bot: Экземпляр бота
     """
 
     def __init__(
         self,
         bot: "Bot",
     ):
+        super().__init__()
         self.bot = bot
 
     async def fetch(self) -> GettedSubscriptions:

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ..connection.base import BaseConnection
 from ..enums.api_path import ApiPath
@@ -12,22 +12,42 @@ if TYPE_CHECKING:
 
 class SendAction(BaseConnection):
     """
-    Класс для отправки действия пользователя (например, индикатора печати) в чат.
+    Класс для отправки действия пользователя (например, индикатора
+    печати) в чат.
 
     https://dev.max.ru/docs-api/methods/POST/chats/-chatId-/actions
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        chat_id (Optional[int]): Идентификатор чата. Если None, действие не отправляется.
-        action (Optional[SenderAction]): Тип действия. По умолчанию SenderAction.TYPING_ON.
+        bot: Экземпляр бота для выполнения запроса.
+        chat_id: Идентификатор чата. Если None,
+            действие не отправляется.
+        action: Тип действия. По умолчанию
+            SenderAction.TYPING_ON.
     """
 
     def __init__(
         self,
         bot: "Bot",
-        chat_id: Optional[int] = None,
-        action: SenderAction = SenderAction.TYPING_ON,
+        chat_id: int | None = None,
+        action: SenderAction | str = SenderAction.TYPING_ON,
     ):
+        super().__init__()
+
+        if not isinstance(action, SenderAction):
+            if not isinstance(action, str):
+                raise TypeError(
+                    f"action должен быть SenderAction или str, "
+                    f"получено: {type(action).__name__}"
+                )
+
+            try:
+                action = SenderAction(action)
+            except ValueError as e:
+                allowed = ", ".join(item.value for item in SenderAction)
+                raise ValueError(
+                    f"Неверный action: {action!r}. Ожидается: {allowed}"
+                ) from e
+
         self.bot = bot
         self.chat_id = chat_id
         self.action = action
@@ -42,9 +62,9 @@ class SendAction(BaseConnection):
 
         bot = self._ensure_bot()
 
-        json: Dict[str, Any] = {}
+        json: dict[str, Any] = {}
 
-        json["action"] = self.action.value
+        json["action"] = self.action
 
         response = await super().request(
             method=HTTPMethod.POST,

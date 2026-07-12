@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List, Optional, cast
+from typing import TYPE_CHECKING, cast
 
 from ..connection.base import BaseConnection
 from ..enums.api_path import ApiPath
@@ -16,11 +16,14 @@ class GetMembersChat(BaseConnection):
     https://dev.max.ru/docs-api/methods/GET/chats/-chatId-/members
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        chat_id (int): Идентификатор чата.
-        user_ids (Optional[List[str]]): Список ID пользователей для фильтрации. По умолчанию None.
-        marker (Optional[int]): Маркер для пагинации (начальная позиция). По умолчанию None.
-        count (Optional[int]): Максимальное количество участников для получения. По умолчанию None.
+        bot: Экземпляр бота для выполнения запроса.
+        chat_id: Идентификатор чата.
+        user_ids: Список ID пользователей для
+            фильтрации. По умолчанию None.
+        marker: Маркер для пагинации
+            (начальная позиция). По умолчанию None.
+        count: Максимальное количество участников
+            для получения. По умолчанию None.
 
     """
 
@@ -28,13 +31,14 @@ class GetMembersChat(BaseConnection):
         self,
         bot: "Bot",
         chat_id: int,
-        user_ids: Optional[List[int]] = None,
-        marker: Optional[int] = None,
-        count: Optional[int] = None,
+        user_ids: list[int] | None = None,
+        marker: int | None = None,
+        count: int | None = None,
     ):
         if count is not None and not (1 <= count <= 100):
             raise ValueError("count не должен быть меньше 1 или больше 100")
 
+        super().__init__()
         self.bot = bot
         self.chat_id = chat_id
         self.user_ids = user_ids
@@ -43,9 +47,11 @@ class GetMembersChat(BaseConnection):
 
     async def fetch(self) -> GettedMembersChat:
         """
-        Выполняет GET-запрос для получения участников чата с опциональной фильтрацией.
+        Выполняет GET-запрос для получения участников чата с
+        опциональной фильтрацией.
 
-        Формирует параметры запроса с учётом фильтров и передаёт их базовому методу.
+        Формирует параметры запроса с учётом фильтров и передаёт их
+        базовому методу.
 
         Returns:
             GettedMembersChat: Объект с данными по участникам чата.
@@ -60,7 +66,7 @@ class GetMembersChat(BaseConnection):
                 [str(user_id) for user_id in self.user_ids]
             )
 
-        if self.marker:
+        if self.marker is not None:
             params["marker"] = self.marker
         if self.count:
             params["count"] = self.count

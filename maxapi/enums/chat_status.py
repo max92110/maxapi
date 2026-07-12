@@ -1,15 +1,19 @@
-from enum import Enum
+from enum import auto, unique
+
+from ._compat import StrEnum
 
 
-class ChatStatus(str, Enum):
+@unique
+class ChatStatus(StrEnum):
     """
     Статус чата относительно пользователя или системы.
 
-    Используется для отображения текущего состояния чата или определения доступных действий.
+    Используется для отображения текущего состояния чата или определения
+    доступных действий.
     """
 
-    ACTIVE = "active"
-    REMOVED = "removed"
-    LEFT = "left"
-    CLOSED = "closed"
-    SUSPENDED = "suspended"
+    ACTIVE = auto()
+    REMOVED = auto()
+    LEFT = auto()
+    CLOSED = auto()
+    SUSPENDED = auto()

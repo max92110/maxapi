@@ -1,11 +1,12 @@
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...enums.attachment import AttachmentType
 from ...types.attachments.buttons import InlineButtonUnion
 from ...types.attachments.upload import AttachmentUpload
 from ...types.users import User
+from ...utils.vcf import VcfInfo, parse_vcf_info
 
 if TYPE_CHECKING:
     from ...bot import Bot
@@ -16,8 +17,8 @@ class StickerAttachmentPayload(BaseModel):
     Данные для вложения типа стикер.
 
     Attributes:
-        url (str): URL стикера.
-        code (str): Код стикера.
+        url: URL стикера.
+        code: Код стикера.
     """
 
     url: str
@@ -29,22 +30,14 @@ class PhotoAttachmentPayload(BaseModel):
     Данные для фото-вложения.
 
     Attributes:
-        photo_id (int): Идентификатор фотографии.
-        token (str): Токен для доступа к фото.
-        url (str): URL фотографии.
+        photo_id: Идентификатор фотографии.
+        token: Токен для доступа к фото.
+        url: URL фотографии.
     """
 
-    photo_id: int | None = None
-    token: str | None = None
-    url: str | None = None
-
-    @model_validator(mode="after")
-    def validate_any_field(self):
-        if not any((self.photo_id, self.token, self.url)):
-            raise ValueError(
-                "Нужно указать хотя бы один из параметров: photo_id, token, url."
-            )
-        return self
+    photo_id: int
+    token: str
+    url: str
 
 
 class OtherAttachmentPayload(BaseModel):
@@ -52,12 +45,25 @@ class OtherAttachmentPayload(BaseModel):
     Данные для общих типов вложений (файлы и т.п.).
 
     Attributes:
-        url (str): URL вложения.
-        token (Optional[str]): Опциональный токен доступа.
+        url: URL вложения.
+        token: Опциональный токен доступа.
     """
 
     url: str
-    token: Optional[str] = None
+    token: str | None = None
+
+
+class ShareAttachmentPayload(BaseModel):
+    """
+    Данные для вложения типа "share".
+
+    Attributes:
+        url: URL расшаренного ресурса.
+        token: Токен доступа.
+    """
+
+    url: str | None = None
+    token: str | None = None
 
 
 class ContactAttachmentPayload(BaseModel):
@@ -65,12 +71,20 @@ class ContactAttachmentPayload(BaseModel):
     Данные для контакта.
 
     Attributes:
-        vcf_info (Optional[str]): Информация в формате vcf.
-        max_info (Optional[User]): Дополнительная информация о пользователе.
+        vcf_info: Информация в формате vcf.
+        hash: Хеш контакта.
+        max_info: Дополнительная информация о пользователе.
     """
 
-    vcf_info: str = ""  # для корректного определения
-    max_info: Optional[User] = None
+    vcf_info: str | None = None
+    hash: str | None = None
+    max_info: User | None = None
+
+    @property
+    def vcf(self) -> VcfInfo:
+        """Доступ к данным из `vcf_info`."""
+
+        return parse_vcf_info(self.vcf_info or "")
 
 
 class ButtonsPayload(BaseModel):
@@ -78,13 +92,28 @@ class ButtonsPayload(BaseModel):
     Данные для вложения с кнопками.
 
     Attributes:
-        buttons (List[List[InlineButtonUnion]]): Двумерный список inline-кнопок.
+        buttons: Двумерный список
+            inline-кнопок.
     """
 
-    buttons: List[List[InlineButtonUnion]]
+    buttons: list[list[InlineButtonUnion]]
 
     def pack(self):
-        return Attachment(type=AttachmentType.INLINE_KEYBOARD, payload=self)  # type: ignore
+        return Attachment(  # type: ignore[call-arg]
+            type=AttachmentType.INLINE_KEYBOARD,
+            payload=self,
+        )
+
+
+AttachmentPayload = (
+    AttachmentUpload
+    | PhotoAttachmentPayload
+    | OtherAttachmentPayload
+    | ShareAttachmentPayload
+    | ButtonsPayload
+    | ContactAttachmentPayload
+    | StickerAttachmentPayload
+)
 
 
 class Attachment(BaseModel):
@@ -92,27 +121,18 @@ class Attachment(BaseModel):
     Универсальный класс вложения с типом и полезной нагрузкой.
 
     Attributes:
-        type (AttachmentType): Тип вложения.
-        payload (Optional[Union[...] ]): Полезная нагрузка, зависит от типа вложения.
+        type: Тип вложения.
+        payload: Полезная нагрузка, зависит
+            от типа вложения.
     """
 
     type: AttachmentType
-    payload: Optional[
-        Union[
-            AttachmentUpload,
-            PhotoAttachmentPayload,
-            OtherAttachmentPayload,
-            ButtonsPayload,
-            ContactAttachmentPayload,
-            StickerAttachmentPayload,
-        ]
-    ] = None
-    bot: Optional[Any] = Field(  # pyright: ignore[reportRedeclaration]
-        default=None, exclude=True
-    )
+    payload: AttachmentPayload | None = None
+    bot: Any | None = Field(default=None, exclude=True)
 
     if TYPE_CHECKING:
-        bot: Optional[Bot]  # type: ignore
+        bot: Bot | None  # type: ignore[no-redef]
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(
+        use_enum_values=True,
+    )

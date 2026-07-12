@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -6,19 +6,30 @@ from ...enums.attachment import AttachmentType
 from .attachment import Attachment
 
 
+class PhotoToken(BaseModel):
+    """
+    Токен загруженного изображения.
+
+    Attributes:
+        token: Закодированная информация загруженного изображения.
+    """
+
+    token: str
+
+
 class PhotoAttachmentRequestPayload(BaseModel):
     """
     Полезная нагрузка для запроса фото-вложения.
 
     Attributes:
-        url (Optional[str]): URL изображения.
-        token (Optional[str]): Токен доступа к изображению.
-        photos (Optional[str]): Дополнительные данные о фотографиях.
+        url: URL изображения.
+        token: Токен существующего вложения.
+        photos: Токены, полученные после загрузки изображений.
     """
 
-    url: Optional[str] = None
-    token: Optional[str] = None
-    photos: Optional[str] = None
+    url: str | None = None
+    token: str | None = None
+    photos: dict[str, PhotoToken] | str | None = None
 
 
 class Image(Attachment):
@@ -26,7 +37,10 @@ class Image(Attachment):
     Вложение с типом изображения.
 
     Attributes:
-        type (Literal['image']): Тип вложения, всегда 'image'.
+        type: Тип вложения, всегда 'image'.
     """
 
     type: Literal[AttachmentType.IMAGE]  # pyright: ignore[reportIncompatibleVariableOverride]
+
+
+__all__ = ["Image", "PhotoAttachmentRequestPayload", "PhotoToken"]

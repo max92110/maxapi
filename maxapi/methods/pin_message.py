@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ..connection.base import BaseConnection
 from ..enums.api_path import ApiPath
@@ -16,10 +16,12 @@ class PinMessage(BaseConnection):
     https://dev.max.ru/docs-api/methods/PUT/chats/-chatId-/pin
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        chat_id (int): Идентификатор чата, в котором закрепляется сообщение.
-        message_id (str): Идентификатор сообщения для закрепления.
-        notify (bool, optional): Отправлять ли уведомление о закреплении (по умолчанию True).
+        bot: Экземпляр бота для выполнения запроса.
+        chat_id: Идентификатор чата, в котором закрепляется
+            сообщение.
+        message_id: Идентификатор сообщения для закрепления.
+        notify: Отправлять ли уведомление о закреплении
+            (по умолчанию True).
     """
 
     def __init__(
@@ -27,8 +29,10 @@ class PinMessage(BaseConnection):
         bot: "Bot",
         chat_id: int,
         message_id: str,
-        notify: Optional[bool] = None,
+        *,
+        notify: bool | None = None,
     ):
+        super().__init__()
         self.bot = bot
         self.chat_id = chat_id
         self.message_id = message_id
@@ -46,7 +50,7 @@ class PinMessage(BaseConnection):
 
         bot = self._ensure_bot()
 
-        json: Dict[str, Any] = {}
+        json: dict[str, Any] = {}
 
         json["message_id"] = self.message_id
         json["notify"] = self.notify

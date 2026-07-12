@@ -17,11 +17,13 @@ class GetUploadURL(BaseConnection):
     https://dev.max.ru/docs-api/methods/POST/uploads
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        type (UploadType): Тип загружаемого файла (например, image, video и т.д.).
+        bot: Экземпляр бота для выполнения запроса.
+        type: Тип загружаемого файла (например, image,
+            video и т.д.).
     """
 
     def __init__(self, bot: "Bot", type: UploadType):
+        super().__init__()
         self.bot = bot
         self.type = type
 

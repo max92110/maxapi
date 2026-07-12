@@ -38,10 +38,7 @@ theme:
 plugins:
   - search:
       lang: ru
-  - autorefs:
-      # Выбирать наиболее специфичный (самый глубокий) URL как основной
-      # Это уменьшит количество предупреждений о дублирующихся URL
-      fallback_to_title: true
+  - autorefs
   - mkdocstrings:
       handlers:
         python:
@@ -102,6 +99,7 @@ nav:
     - Http_method: enums/http_method.md
     - Intent: enums/intent.md
     - Message_link_type: enums/message_link_type.md
+    - Format: enums/format.md
     - Overview: enums/index.md
     - Parse_mode: enums/parse_mode.md
     - Sender_action: enums/sender_action.md
@@ -115,7 +113,10 @@ nav:
     - Max: exceptions/max.md
   - Filters:
     - Callback_payload: filters/callback_payload.md
+    - Channel_post: filters/channel_post.md
+    - Contact: filters/contact.md
     - Command: filters/command.md
+    - Exception_type: filters/exception_type.md
     - Filter: filters/filter.md
     - Handler: filters/handler.md
     - Middleware: filters/middleware.md
@@ -203,6 +204,7 @@ nav:
         - Button: types/attachments/buttons/button.md
         - Callback_button: types/attachments/buttons/callback_button.md
         - Chat_button: types/attachments/buttons/chat_button.md
+        - Clipboard_button: types/attachments/buttons/clipboard_button.md
         - Link_button: types/attachments/buttons/link_button.md
         - Message_button: types/attachments/buttons/message_button.md
         - Open_app_button: types/attachments/buttons/open_app_button.md
@@ -225,11 +227,14 @@ nav:
       - Message_edited: types/updates/message_edited.md
       - Message_removed: types/updates/message_removed.md
       - Overview: types/updates/index.md
+      - BaseUpdate: types/updates/base_update.md
       - Update: types/updates/update.md
       - User_added: types/updates/user_added.md
       - User_removed: types/updates/user_removed.md
   - Utils:
+    - Deep_linking: utils/deep_linking.md
     - Inline_keyboard: utils/inline_keyboard.md
     - Message: utils/message.md
     - Overview: utils/index.md
     - Updates: utils/updates.md
+    - Vcf: utils/vcf.md

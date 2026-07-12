@@ -16,8 +16,9 @@ class GetMessage(BaseConnection):
     https://dev.max.ru/docs-api/methods/GET/messages/-messageId-
 
     Attributes:
-        bot (Bot): Экземпляр бота для выполнения запроса.
-        message_id (Optional[str]): ID сообщения (mid), чтобы получить одно сообщение в чате.
+        bot: Экземпляр бота для выполнения запроса.
+        message_id: ID сообщения (mid), чтобы получить
+            одно сообщение в чате.
     """
 
     def __init__(
@@ -25,6 +26,7 @@ class GetMessage(BaseConnection):
         bot: "Bot",
         message_id: str,
     ):
+        super().__init__()
         self.bot = bot
         self.message_id = message_id
 

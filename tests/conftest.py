@@ -1,11 +1,13 @@
 """Конфигурация и фикстуры для pytest."""
 
 import os
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
+from faker import Faker
 
 # Загружаем переменные окружения из .env файла
 try:
@@ -16,7 +18,8 @@ try:
     env_file = project_root / ".env"
     tests_env = Path(__file__).parent / ".env"
 
-    # Пробуем загрузить .env из разных мест (приоритет: корень проекта, затем tests/)
+    # Пробуем загрузить .env из разных мест
+    # (приоритет: корень проекта, затем tests/)
     if env_file.exists():
         load_dotenv(env_file, override=True)
     elif tests_env.exists():
@@ -31,6 +34,44 @@ except ImportError:
 # Core Stuff
 from maxapi import Bot, Dispatcher
 from maxapi.client.default import DefaultConnectionProperties
+from maxapi.enums.update import UpdateType
+
+pytest_plugins = ["tests.fixtures.updates"]
+
+# Консистентность данного маппинга проверяется в тесте
+# test_fixtures_cover_all_update_union_types.
+# Т.е. если появится новый тип обновления, но не будет добавлена
+# соответствующая фикстура, тест упадет и напомнит о необходимости
+# обновить этот словарь и проверить работу приложения с новым типом
+_FIXTURE_NAME_BY_UPDATE: dict[UpdateType, str] = {
+    UpdateType.MESSAGE_CREATED: "fixture_message_created",
+    UpdateType.MESSAGE_EDITED: "fixture_message_edited",
+    UpdateType.MESSAGE_REMOVED: "fixture_message_removed",
+    UpdateType.MESSAGE_CALLBACK: "fixture_message_callback",
+    UpdateType.MESSAGE_CHAT_CREATED: "fixture_message_chat_created",
+    UpdateType.BOT_ADDED: "fixture_bot_added",
+    UpdateType.BOT_REMOVED: "fixture_bot_removed",
+    UpdateType.BOT_STARTED: "fixture_bot_started",
+    UpdateType.BOT_STOPPED: "fixture_bot_stopped",
+    UpdateType.USER_ADDED: "fixture_user_added",
+    UpdateType.USER_REMOVED: "fixture_user_removed",
+    UpdateType.DIALOG_CLEARED: "fixture_dialog_cleared",
+    UpdateType.DIALOG_MUTED: "fixture_dialog_muted",
+    UpdateType.DIALOG_UNMUTED: "fixture_dialog_unmuted",
+    UpdateType.DIALOG_REMOVED: "fixture_dialog_removed",
+    UpdateType.CHAT_TITLE_CHANGED: "fixture_chat_title_changed",
+}
+
+
+@pytest.fixture(
+    params=list(_FIXTURE_NAME_BY_UPDATE.keys()),
+    ids=lambda ut: ut.name.lower(),
+)
+def update(request):
+    """Параметризованная фикстура со всеми типами обновлений."""
+    update_type = request.param
+    fixture_name = _FIXTURE_NAME_BY_UPDATE[update_type]
+    return request.getfixturevalue(fixture_name)
 
 
 @pytest.fixture
@@ -41,7 +82,10 @@ def mock_bot_token():
 
 @pytest.fixture
 def bot_token_from_env():
-    """Фикстура для получения токена из окружения (для интеграционных тестов)."""
+    """Фикстура для получения токена из окружения.
+
+    (для интеграционных тестов)
+    """
     return os.environ.get("MAX_BOT_TOKEN")
 
 
@@ -61,7 +105,7 @@ def test_chat_id_from_env():
 def mock_session():
     """Фикстура с мок-сессией aiohttp."""
     session = AsyncMock(spec=aiohttp.ClientSession)
-    session.base_url = "https://platform-api.max.ru"
+    session.base_url = "https://platform-api2.max.ru"
     session.headers = {}
     session.close = AsyncMock()
     session.request = AsyncMock()
@@ -147,6 +191,34 @@ def sample_context():
 
 
 @pytest.fixture
+def faker():
+    """Возвращает экземпляр Faker для генерации тестовых данных."""
+    return Faker()
+
+
+@pytest.fixture
+def fake_user(faker):
+    """Фабрика данных для создания тестового User.
+
+    Возвращает функцию, принимающую переопределения полей и
+    возвращающую словарь с валидными значениями для модели `User`.
+    """
+
+    def _factory(**overrides):
+        data = {
+            "user_id": faker.random_int(min=1, max=10_000),
+            "first_name": faker.first_name(),
+            "last_name": faker.last_name(),
+            "is_bot": False,
+            "last_activity_time": int(faker.date_time().timestamp()),
+        }
+        data.update(overrides)
+        return data
+
+    return _factory
+
+
+@pytest.fixture
 async def integration_bot(bot_token_from_env):
     """Фикстура для интеграционных тестов с реальным ботом.
 
@@ -161,13 +233,12 @@ async def integration_bot(bot_token_from_env):
     try:
         yield bot
     finally:
-        # Закрываем сессию после теста для предотвращения "Event loop is closed"
+        # Закрываем сессию после теста для предотвращения
+        # "Event loop is closed"
         if bot.session and not bot.session.closed:
-            try:
+            # Игнорируем ошибки при закрытии, если event loop уже закрыт
+            with suppress(Exception):
                 await bot.close_session()
-            except Exception:
-                # Игнорируем ошибки при закрытии, если event loop уже закрыт
-                pass
 
 
 @pytest.fixture(autouse=True)
@@ -188,11 +259,12 @@ def preserve_env_vars():
 
 
 def pytest_collection_modifyitems(config, items):
-    """Автоматически пропускает тесты с маркером integration, если не задан токен."""
+    """Автоматически пропускает тесты с маркером integration,
+    если не задан токен.
+    """
     if not os.environ.get("MAX_BOT_TOKEN"):
-        skip_integration = pytest.mark.skip(
-            reason="Интеграционные тесты пропущены: MAX_BOT_TOKEN не установлен"
-        )
+        reason = "MAX_BOT_TOKEN не установлен, пропускаем интеграционные тесты"
+        skip_integration = pytest.mark.skip(reason=reason)
         for item in items:
             if "integration" in item.keywords:
                 item.add_marker(skip_integration)

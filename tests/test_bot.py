@@ -8,7 +8,7 @@ import pytest
 # Core Stuff
 from maxapi import Bot
 from maxapi.client.default import DefaultConnectionProperties
-from maxapi.enums.parse_mode import ParseMode
+from maxapi.enums.parse_mode import ParseMode, TextFormat
 from maxapi.enums.sender_action import SenderAction
 from maxapi.exceptions.max import InvalidToken
 
@@ -44,7 +44,13 @@ class TestBotInitialization:
 
     def test_bot_init_with_parse_mode(self, mock_bot_token):
         """Тест создания бота с parse_mode."""
-        bot = Bot(token=mock_bot_token, parse_mode=ParseMode.MARKDOWN)
+        with pytest.deprecated_call():
+            bot = Bot(token=mock_bot_token, parse_mode=ParseMode.MARKDOWN)
+        assert bot.parse_mode == ParseMode.MARKDOWN
+
+    def test_bot_init_with_format(self, mock_bot_token):
+        """Тест создания бота с format."""
+        bot = Bot(token=mock_bot_token, format=TextFormat.MARKDOWN)
         assert bot.parse_mode == ParseMode.MARKDOWN
 
     def test_bot_init_with_notify(self, mock_bot_token):
@@ -62,6 +68,11 @@ class TestBotInitialization:
         connection = DefaultConnectionProperties()
         bot = Bot(token=mock_bot_token, default_connection=connection)
         assert bot.default_connection is connection
+
+    def test_bot_default_api_url(self, mock_bot_token):
+        """Тест URL API по умолчанию."""
+        bot = Bot(token=mock_bot_token)
+        assert bot.api_url == "https://platform-api2.max.ru"
 
     def test_bot_init_after_input_media_delay(self, mock_bot_token):
         """Тест создания бота с custom задержкой после медиа."""
@@ -88,6 +99,13 @@ class TestBotProperties:
         # После вызова get_me() должно быть установлено
         # (это проверяется в интеграционных тестах)
 
+    def test_repr_does_not_leak_token(self, mock_bot_token):
+        """Тест __repr__: токен не должен попасть в строку представления."""
+        bot = Bot(token=mock_bot_token)
+        result = repr(bot)
+        assert mock_bot_token not in result
+        assert result == "Bot(token='***')"
+
 
 class TestBotResolveMethods:
     """Тесты методов разрешения параметров."""
@@ -95,21 +113,30 @@ class TestBotResolveMethods:
     def test_resolve_notify(self, bot):
         """Тест _resolve_notify."""
         bot.notify = True
-        assert bot._resolve_notify(None) is True
-        assert bot._resolve_notify(False) is False
-        assert bot._resolve_notify(True) is True
+        assert bot._resolve_notify(notify=None) is True
+        assert bot._resolve_notify(notify=False) is False
+        assert bot._resolve_notify(notify=True) is True
 
-    def test_resolve_parse_mode(self, bot):
-        """Тест _resolve_parse_mode."""
+    def test_resolve_format(self, bot):
+        """Тест resolve_format."""
         bot.parse_mode = ParseMode.MARKDOWN
-        assert bot._resolve_parse_mode(None) == ParseMode.MARKDOWN
-        assert bot._resolve_parse_mode(ParseMode.HTML) == ParseMode.HTML
+        assert bot.resolve_format(None) == ParseMode.MARKDOWN
+        assert bot.resolve_format(TextFormat.HTML) == ParseMode.HTML
+
+        with pytest.deprecated_call():
+            assert bot.resolve_format(None, ParseMode.HTML) == ParseMode.HTML
 
     def test_resolve_disable_link_preview(self, bot):
         """Тест _resolve_disable_link_preview."""
         bot.disable_link_preview = True
-        assert bot._resolve_disable_link_preview(None) is True
-        assert bot._resolve_disable_link_preview(False) is False
+        assert (
+            bot._resolve_disable_link_preview(disable_link_preview=None)
+            is True
+        )
+        assert (
+            bot._resolve_disable_link_preview(disable_link_preview=False)
+            is False
+        )
 
 
 class TestBotSessionManagement:
@@ -164,6 +191,108 @@ class TestBotMethods:
             assert mock_fetch.called
 
     @pytest.mark.asyncio
+    async def test_send_invalid_action_as_string(self, bot):
+        """Тест вызова send_action с неверными данными."""
+        # Core Stuff
+        from maxapi.methods.send_action import SendAction
+
+        available_actions = ", ".join(action.value for action in SenderAction)
+
+        with patch.object(
+            SendAction, "fetch", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = Mock()
+
+            with pytest.raises(ValueError) as exc_info:  # noqa: PT011
+                await bot.send_action(chat_id=12345, action="fake_action")
+
+            exc_message = str(exc_info.value)
+
+            assert "Неверный" in exc_message
+            assert available_actions in exc_message
+
+    @pytest.mark.asyncio
+    async def test_send_valid_action_as_string(self, bot):
+        """Тест вызова send_action с верными данными."""
+        # Core Stuff
+        from maxapi.methods.send_action import SendAction
+
+        with patch.object(
+            SendAction, "fetch", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = Mock()
+
+            await bot.send_action(chat_id=12345, action="typing_on")
+
+            assert mock_fetch.called
+
+    @pytest.mark.asyncio
+    async def test_send_action_without_action_param(self, bot):
+        """Тест вызова send_action без передачи action."""
+        # Core Stuff
+        from maxapi.methods.send_action import SendAction
+
+        with patch.object(
+            SendAction, "fetch", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = Mock()
+
+            await bot.send_action(chat_id=12345)
+
+            assert mock_fetch.called
+
+    @pytest.mark.asyncio
+    async def test_delete_chat_is_deprecated(self, bot):
+        """Тест предупреждения для удалённого из swagger метода."""
+        from maxapi.methods.delete_chat import DeleteChat
+
+        with patch.object(
+            DeleteChat, "fetch", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = Mock()
+
+            with pytest.deprecated_call(match="delete_chat"):
+                await bot.delete_chat(chat_id=12345)
+
+            mock_fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_chats_is_deprecated(self, bot):
+        """Тест предупреждения для неподдерживаемого GET /chats."""
+        from maxapi.methods.get_chats import GetChats
+
+        with patch.object(
+            GetChats, "fetch", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = Mock()
+
+            with pytest.deprecated_call(match="GET /chats"):
+                await bot.get_chats(count=5)
+
+            mock_fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_action_with_wrong_action_type(self, bot):
+        """Тест вызова send_action с передачей неверного типа (не SenderAction, не str)."""  # noqa: E501
+        # Core Stuff
+        from maxapi.methods.send_action import SendAction
+
+        with patch.object(
+            SendAction, "fetch", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = Mock()
+
+            wrong_action = 123
+            wrong_action_type = type(wrong_action).__name__
+
+            with pytest.raises(TypeError) as exc_info:
+                await bot.send_action(chat_id=12345, action=wrong_action)
+
+            exc_message = str(exc_info.value)
+
+            assert wrong_action_type in exc_message
+
+    @pytest.mark.asyncio
     async def test_get_me_structure(self, bot):
         """Тест структуры вызова get_me."""
         # Core Stuff
@@ -207,14 +336,6 @@ class TestBotIntegration:
         subs = await integration_bot.get_subscriptions()
         assert subs is not None
         assert hasattr(subs, "subscriptions")
-
-    @pytest.mark.asyncio
-    @pytest.mark.integration
-    async def test_get_chats_integration(self, integration_bot):
-        """Интеграционный тест get_chats."""
-        chats = await integration_bot.get_chats(count=5)
-        assert chats is not None
-        assert hasattr(chats, "chats")
 
     @pytest.mark.asyncio
     async def test_close_session_cleanup(self, integration_bot):

@@ -1,66 +1,29 @@
 import asyncio
 import json
-from typing import Any, Dict, Optional, Union, TYPE_CHECKING
+from typing import Any
 
-from ..context.state_machine import State, StatesGroup
-
-if TYPE_CHECKING:
-    from redis.asyncio import Redis
+from ..context.base import BaseContext
+from ..context.state_machine import State
 
 
-class MemoryContext:
+def _ttl_to_ms(ttl: float | None) -> int | None:
+    if ttl is None:
+        return None
+    return max(1, round(ttl * 1000))
+
+
+class MemoryContext(BaseContext):
     """
-    Контекст хранения данных пользователя с блокировками.
-
-    Args:
-        chat_id (Optional[int]): Идентификатор чата
-        user_id (Optional[int]): Идентификатор пользователя
+    Контекст хранения данных пользователя в оперативной памяти.
     """
 
     def __init__(
-        self,
-        chat_id: Optional[int],
-        user_id: Optional[int],
-        redis_client: Optional["Redis[Any]"] = None,
-        redis_prefix: str = "maxapi:context",
-        redis_ttl: Optional[int] = None,
-    ):
-        self.chat_id = chat_id
-        self.user_id = user_id
-        self._context: Dict[str, Any] = {}
+        self, chat_id: int | None, user_id: int | None, **kwargs: Any
+    ) -> None:
+        super().__init__(chat_id, user_id, **kwargs)
+        self._context: dict[str, Any] = {}
         self._state: State | str | None = None
         self._lock = asyncio.Lock()
-        self._redis = redis_client
-        self._redis_prefix = redis_prefix.rstrip(":")
-        self._redis_ttl = redis_ttl
-
-    def _key(self, kind: str) -> str:
-        chat = "none" if self.chat_id is None else str(self.chat_id)
-        user = "none" if self.user_id is None else str(self.user_id)
-        return f"{self._redis_prefix}:{kind}:{chat}:{user}"
-
-    @staticmethod
-    def _serialize_state(state: Optional[Union[State, str]]) -> Optional[str]:
-        if state is None:
-            return None
-        if isinstance(state, State):
-            return state.name
-        return str(state)
-
-    @staticmethod
-    def _restore_state(state_name: str | None) -> Optional[State | str]:
-        if not state_name:
-            return None
-
-        for group in StatesGroup.__subclasses__():
-            for attr in dir(group):
-                candidate = getattr(group, attr)
-                if isinstance(candidate, State) and str(candidate) == state_name:
-                    return candidate
-
-        state = State()
-        state.name = state_name
-        return state
 
     async def get_data(self) -> dict[str, Any]:
         """
@@ -71,22 +34,11 @@ class MemoryContext:
         """
 
         async with self._lock:
-            if not self._redis:
-                return self._context
+            await self._expire_if_needed()
+            self._ttl_tracker.touch()
+            return self._context.copy()
 
-            raw = await self._redis.get(self._key("data"))
-            if raw is None:
-                return {}
-
-            if isinstance(raw, bytes):
-                raw = raw.decode()
-
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                return {}
-
-    async def set_data(self, data: dict[str, Any]):
+    async def set_data(self, data: dict[str, Any]) -> None:
         """
         Полностью заменяет контекст данных.
 
@@ -95,48 +47,28 @@ class MemoryContext:
         """
 
         async with self._lock:
-            if not self._redis:
-                self._context = data
-            else:
-                await self._redis.set(
-                    self._key("data"),
-                    json.dumps(data, default=str),
-                    ex=self._redis_ttl,
-                )
+            await self._expire_if_needed()
+            self._context = data
+            self._ttl_tracker.touch()
 
-    async def update_data(self, **kwargs: Any) -> None:
+    async def update_data(self, **kwargs: Any) -> dict[str, Any]:
         """
         Обновляет контекст данных новыми значениями.
 
         Args:
             **kwargs: Пары ключ-значение для обновления
+
+        Returns:
+            Актуальный словарь данных.
         """
 
         async with self._lock:
-            if not self._redis:
-                self._context.update(kwargs)
-            else:
-                raw = await self._redis.get(self._key("data"))
+            await self._expire_if_needed()
+            self._context.update(kwargs)
+            self._ttl_tracker.touch()
+            return self._context.copy()
 
-                if raw is None:
-                    current = {}
-                else:
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-
-                    try:
-                        current = json.loads(raw)
-                    except json.JSONDecodeError:
-                        current = {}
-
-                current.update(kwargs)
-                await self._redis.set(
-                    self._key("data"),
-                    json.dumps(current, default=str),
-                    ex=self._redis_ttl,
-                )
-
-    async def set_state(self, state: Optional[Union[State, str]] = None):
+    async def set_state(self, state: State | str | None = None) -> None:
         """
         Устанавливает новое состояние.
 
@@ -145,22 +77,11 @@ class MemoryContext:
         """
 
         async with self._lock:
-            serialized_state = self._serialize_state(state)
+            await self._expire_if_needed()
+            self._state = state
+            self._ttl_tracker.touch()
 
-            if not self._redis:
-                self._state = state
-            else:
-                key = self._key("state")
-                if serialized_state is None:
-                    await self._redis.delete(key)
-                else:
-                    await self._redis.set(
-                        key, serialized_state, ex=self._redis_ttl
-                    )
-
-                self._state = self._restore_state(serialized_state)
-
-    async def get_state(self) -> Optional[State | str]:
+    async def get_state(self) -> State | str | None:
         """
         Возвращает текущее состояние.
 
@@ -169,23 +90,11 @@ class MemoryContext:
         """
 
         async with self._lock:
-            if not self._redis:
-                return self._state
+            await self._expire_if_needed()
+            self._ttl_tracker.touch()
+            return self._state
 
-            raw = await self._redis.get(self._key("state"))
-
-            if raw is None:
-                self._state = None
-                return None
-
-            if isinstance(raw, bytes):
-                raw = raw.decode()
-
-            restored = self._restore_state(raw)
-            self._state = restored
-            return restored
-
-    async def clear(self):
+    async def clear(self) -> None:
         """
         Очищает контекст и сбрасывает состояние.
         """
@@ -193,6 +102,118 @@ class MemoryContext:
         async with self._lock:
             self._state = None
             self._context = {}
-            if self._redis:
-                await self._redis.delete(self._key("data"))
-                await self._redis.delete(self._key("state"))
+            self._ttl_tracker.clear()
+
+    async def _expire_if_needed(self) -> None:
+        """Очищает контекст, если его TTL истёк."""
+        if self._ttl_tracker.is_expired():
+            self._state = None
+            self._context = {}
+            self._ttl_tracker.clear()
+
+
+class RedisContext(BaseContext):
+    """
+    Контекст хранения данных пользователя в Redis.
+    Требует установленной библиотеки redis: pip install redis
+    """
+
+    def __init__(
+        self,
+        chat_id: int | None,
+        user_id: int | None,
+        redis_client: Any,  # redis.asyncio.Redis
+        key_prefix: str = "maxapi",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(chat_id, user_id, **kwargs)
+        self.redis = redis_client
+        self.prefix = f"{key_prefix}:{chat_id}:{user_id}"
+        self.data_key = f"{self.prefix}:data"
+        self.state_key = f"{self.prefix}:state"
+
+    async def get_data(self) -> dict[str, Any]:
+        data = await self.redis.get(self.data_key)
+        await self._touch_redis_ttl()
+        return json.loads(data) if data else {}
+
+    async def set_data(self, data: dict[str, Any]) -> None:
+        ttl_ms = _ttl_to_ms(self.ttl)
+        payload = json.dumps(data)
+        if ttl_ms is None:
+            await self.redis.set(self.data_key, payload)
+        else:
+            await self.redis.set(self.data_key, payload, px=ttl_ms)
+            await self.redis.pexpire(self.state_key, ttl_ms)
+
+    async def update_data(self, **kwargs: Any) -> dict[str, Any]:
+        """
+        Атомарно обновляет данные.
+
+        Returns:
+            Актуальный словарь данных.
+        """
+        lua_script = """
+        local data = redis.call('get', KEYS[1])
+        local decoded = {}
+        if data then
+            decoded = cjson.decode(data)
+        end
+        local updates = cjson.decode(ARGV[1])
+        for k, v in pairs(updates) do
+            decoded[k] = v
+        end
+        if ARGV[2] ~= "" then
+            redis.call('set', KEYS[1], cjson.encode(decoded), 'PX', ARGV[2])
+        else
+            redis.call('set', KEYS[1], cjson.encode(decoded))
+        end
+        return cjson.encode(decoded)
+        """
+        ttl_ms = _ttl_to_ms(self.ttl)
+        result = await self.redis.eval(
+            lua_script,
+            1,
+            self.data_key,
+            json.dumps(kwargs),
+            str(ttl_ms) if ttl_ms is not None else "",
+        )
+        if ttl_ms is not None:
+            await self.redis.pexpire(self.state_key, ttl_ms)
+        if isinstance(result, bytes):
+            result = result.decode("utf-8")
+        return json.loads(result) if result else {}
+
+    async def set_state(self, state: State | str | None = None) -> None:
+        if state is None:
+            await self.redis.delete(self.state_key)
+        else:
+            # Сохраняем имя состояния, если это объект State
+            state_val = state.name if isinstance(state, State) else state
+            await self.redis.set(self.state_key, str(state_val))
+        await self._touch_redis_ttl()
+
+    async def get_state(self) -> State | str | None:
+        state = await self.redis.get(self.state_key)
+        await self._touch_redis_ttl()
+        if isinstance(state, bytes):
+            return state.decode("utf-8")
+        return state
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    async def clear(self) -> None:
+        await self.redis.delete(self.data_key, self.state_key)
+        self._ttl_tracker.clear()
+
+    async def _touch_redis_ttl(self) -> None:
+        """Продлевает TTL обоих ключей контекста при активности."""
+        ttl_ms = _ttl_to_ms(self.ttl)
+        if ttl_ms is None:
+            return
+        await self.redis.pexpire(self.data_key, ttl_ms)
+        await self.redis.pexpire(self.state_key, ttl_ms)
