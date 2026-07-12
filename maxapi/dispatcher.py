@@ -1501,6 +1501,7 @@ class Dispatcher(BotMixin):
                 e,
                 exc_info=e.cause,
             )
+            raise e
         except MiddlewareException as e:
             if await self._process_error(
                 event_object=event_object,
